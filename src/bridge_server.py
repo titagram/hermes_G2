@@ -17,10 +17,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import binascii
 import json
 import logging
 import os
 import signal
+import tempfile
+import threading
 import time
 import uuid
 from typing import Any, Dict, Optional, Set
@@ -36,12 +40,18 @@ try:
 except ImportError:
     raise SystemExit("aiohttp is required: pip install aiohttp")
 
+from .g2_surface import build_default_surface, find_surface_item, prompt_for_action
+
 logger = logging.getLogger("hermes-glass")
 
 # ─── defaults ────────────────────────────────────────────────────
 DEFAULT_WS_HOST = "0.0.0.0"
 DEFAULT_WS_PORT = 18790
 DEFAULT_HERMES_URL = "http://127.0.0.1:8642"
+DEFAULT_STT_PROVIDER = "auto"
+DEFAULT_LOCAL_STT_MODEL = "tiny"
+DEFAULT_LOCAL_STT_DEVICE = "cpu"
+DEFAULT_LOCAL_STT_COMPUTE_TYPE = "int8"
 PROTOCOL_VERSION = 3
 DELTA_THRESHOLD = 40  # chars before a delta flush
 
@@ -66,14 +76,46 @@ def make_hello_ok(msg_id: str) -> str:
 
 # ─── Hermes API client ───────────────────────────────────────────
 
+class HermesSttError(RuntimeError):
+    """Hermes returned an error from its OpenAI-compatible STT endpoint."""
+
+    def __init__(self, status: int, body: str):
+        super().__init__(f"Hermes STT API error {status}")
+        self.status = status
+        self.body = body
+
+
 class HermesClient:
     """Thin async client for the Hermes API Server (OpenAI-compatible)."""
 
-    def __init__(self, base_url: str, api_key: str, model: str = "hermes-agent"):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str = "hermes-agent",
+        stt_model: str = "whisper-1",
+        stt_provider: str = DEFAULT_STT_PROVIDER,
+        local_stt_model: str = DEFAULT_LOCAL_STT_MODEL,
+        local_stt_device: str = DEFAULT_LOCAL_STT_DEVICE,
+        local_stt_compute_type: str = DEFAULT_LOCAL_STT_COMPUTE_TYPE,
+        local_stt_language: Optional[str] = None,
+    ):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
+        self.stt_model = stt_model
+        provider = stt_provider.strip().lower()
+        if provider not in {"auto", "hermes", "local"}:
+            raise ValueError("stt_provider must be one of: auto, hermes, local")
+        self.stt_provider = provider
+        self.local_stt_model = local_stt_model
+        self.local_stt_device = local_stt_device
+        self.local_stt_compute_type = local_stt_compute_type
+        self.local_stt_language = local_stt_language or None
         self._session: Optional[aiohttp.ClientSession] = None
+        self._hermes_stt_unavailable = False
+        self._local_stt = None
+        self._local_stt_lock = threading.Lock()
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -124,6 +166,111 @@ class HermesClient:
         except aiohttp.ClientError as exc:
             logger.error("Hermes API error: %s", exc)
             yield (None, f"[Connection error: {exc}]", None)
+
+    async def transcribe_audio(
+        self,
+        audio_bytes: bytes,
+        filename: str = "g2.wav",
+        mime_type: str = "audio/wav",
+        model: Optional[str] = None,
+    ) -> str:
+        """Transcribe a WAV file through Hermes STT or the local fallback provider."""
+        if self.stt_provider in {"auto", "hermes"} and not self._hermes_stt_unavailable:
+            try:
+                return await self._transcribe_audio_hermes(audio_bytes, filename, mime_type, model)
+            except HermesSttError as exc:
+                logger.error("Hermes STT API %d: %s", exc.status, exc.body[:300])
+                if self.stt_provider == "hermes" or exc.status != 404:
+                    raise
+                self._hermes_stt_unavailable = True
+                logger.warning("Hermes STT endpoint returned 404; using local STT fallback")
+
+        if self.stt_provider in {"auto", "local"}:
+            return await self._transcribe_audio_local(audio_bytes)
+
+        raise RuntimeError("No STT provider is available")
+
+    async def _transcribe_audio_hermes(
+        self,
+        audio_bytes: bytes,
+        filename: str,
+        mime_type: str,
+        model: Optional[str],
+    ) -> str:
+        """POST /v1/audio/transcriptions with a WAV file. Returns transcript text."""
+        session = await self._get_session()
+        form = aiohttp.FormData()
+        form.add_field("model", model or self.stt_model)
+        form.add_field("file", audio_bytes, filename=filename, content_type=mime_type)
+        url = f"{self.base_url}/v1/audio/transcriptions"
+
+        async with session.post(url, data=form) as resp:
+            body = await resp.text()
+            if resp.status != 200:
+                raise HermesSttError(resp.status, body)
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("Hermes STT returned invalid JSON") from exc
+            text = data.get("text") or data.get("transcript") or data.get("result") or ""
+            return str(text).strip()
+
+    async def _transcribe_audio_local(self, audio_bytes: bytes) -> str:
+        return await asyncio.to_thread(self._transcribe_audio_local_sync, audio_bytes)
+
+    def _load_local_stt(self):
+        with self._local_stt_lock:
+            if self._local_stt is not None:
+                return self._local_stt
+            try:
+                from faster_whisper import WhisperModel
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Local STT requires faster-whisper. Install bridge requirements "
+                    "or set HERMES_STT_PROVIDER=hermes."
+                ) from exc
+
+            logger.info(
+                "Loading local STT model %s (device=%s, compute_type=%s)",
+                self.local_stt_model,
+                self.local_stt_device,
+                self.local_stt_compute_type,
+            )
+            self._local_stt = WhisperModel(
+                self.local_stt_model,
+                device=self.local_stt_device,
+                compute_type=self.local_stt_compute_type,
+            )
+            return self._local_stt
+
+    def _transcribe_audio_local_sync(self, audio_bytes: bytes) -> str:
+        model = self._load_local_stt()
+        tmp_name = ""
+        try:
+            with tempfile.NamedTemporaryFile(prefix="hermes-g2-", suffix=".wav", delete=False) as fh:
+                fh.write(audio_bytes)
+                tmp_name = fh.name
+
+            segments, info = model.transcribe(
+                tmp_name,
+                beam_size=1,
+                vad_filter=True,
+                language=self.local_stt_language,
+            )
+            parts = [segment.text.strip() for segment in segments if segment.text and segment.text.strip()]
+            text = " ".join(parts).strip()
+            logger.info(
+                "Local STT transcribed %.2fs audio to %d chars",
+                getattr(info, "duration", 0.0) or 0.0,
+                len(text),
+            )
+            return text
+        finally:
+            if tmp_name:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
 
     async def close(self):
         if self._session and not self._session.closed:
@@ -194,11 +341,52 @@ class BridgeConnection:
             logger.info("Handshake ok for %s (protocol %d)", self.conn_id, PROTOCOL_VERSION)
             return
 
+        if method == "bridge.capabilities":
+            await self.ws.send_str(make_response(msg_id, {
+                "audioTranscribe": True,
+                "bootstrap": True,
+                "configVersion": 2,
+                "defaultSttModel": self.hermes.stt_model,
+                "g2Surface": True,
+                "sttProvider": self.hermes.stt_provider,
+                "localSttModel": self.hermes.local_stt_model,
+                "protocol": PROTOCOL_VERSION,
+                "surfaceVersion": 1,
+            }))
+            return
+
+        if method in {"g2.surface.get", "g2.surface.refresh"}:
+            await self.ws.send_str(make_response(msg_id, build_default_surface()))
+            return
+
+        if method == "g2.bootstrap.status":
+            await self.ws.send_str(make_response(msg_id, {
+                "installed": False,
+                "plugin": "hermes-g2",
+                "expectedVersion": "0.1.0",
+                "installAvailable": True,
+                "method": "hermes_plugin_install",
+                "message": "Hermes G2 plugin bootstrap is not installed yet.",
+            }))
+            return
+
+        if method == "g2.action.run":
+            await self._handle_g2_action_run(msg_id, params)
+            return
+
+        if method.startswith("g2."):
+            await self.ws.send_str(make_error(msg_id, 404, f"unknown G2 method: {method}"))
+            return
+
         if method == "chat.send":
             text = params.get("message", "")
             session_key = params.get("sessionKey", self.agent_id)
             await self.ws.send_str(make_response(msg_id, {"accepted": True}))
             asyncio.create_task(self._handle_chat(session_key, text))
+            return
+
+        if method == "audio.transcribe":
+            await self._handle_audio_transcribe(msg_id, params)
             return
 
         if method == "chat.subscribe":
@@ -217,6 +405,79 @@ class BridgeConnection:
 
         # Generic ack
         await self.ws.send_str(make_response(msg_id, {"ok": True}))
+
+    async def _handle_g2_action_run(self, msg_id: str, params: dict):
+        action_id = params.get("id", "")
+        if not isinstance(action_id, str) or not action_id.strip():
+            await self.ws.send_str(make_error(msg_id, 400, "action id is required"))
+            return
+
+        surface = build_default_surface(agent_state="busy")
+        item = find_surface_item(surface, action_id.strip())
+        if item is None:
+            await self.ws.send_str(make_error(msg_id, 404, f"unknown action: {action_id}"))
+            return
+
+        item_type = item.get("type")
+        if item_type == "data":
+            await self.ws.send_str(make_response(msg_id, {"state": "detail", "item": item}))
+            return
+
+        if item_type == "voice":
+            await self.ws.send_str(make_response(msg_id, {"state": "voice", "item": item}))
+            return
+
+        if item_type != "action":
+            await self.ws.send_str(make_error(msg_id, 400, f"unsupported item type: {item_type}"))
+            return
+
+        prompt = prompt_for_action(action_id.strip())
+        if not prompt:
+            await self.ws.send_str(make_error(msg_id, 404, f"no prompt configured for action: {action_id}"))
+            return
+
+        session_key = params.get("sessionKey", self.agent_id)
+        if not isinstance(session_key, str) or not session_key.strip():
+            session_key = self.agent_id
+
+        await self.ws.send_str(make_response(msg_id, {
+            "accepted": True,
+            "state": "running",
+            "id": action_id.strip(),
+            "sessionKey": session_key,
+        }))
+        asyncio.create_task(self._handle_chat(session_key, prompt))
+
+    async def _handle_audio_transcribe(self, msg_id: str, params: dict):
+        audio_b64 = params.get("audioBase64", "")
+        mime_type = params.get("mimeType", "audio/wav")
+        if not isinstance(audio_b64, str) or not audio_b64:
+            await self.ws.send_str(make_error(msg_id, 400, "audioBase64 is required"))
+            return
+
+        try:
+            audio_bytes = base64.b64decode(audio_b64, validate=True)
+        except (binascii.Error, ValueError):
+            await self.ws.send_str(make_error(msg_id, 400, "audioBase64 is invalid"))
+            return
+
+        if len(audio_bytes) > 1_200_000:
+            await self.ws.send_str(make_error(msg_id, 413, "audio payload is too large"))
+            return
+
+        try:
+            stt_model = params.get("sttModel")
+            text = await self.hermes.transcribe_audio(
+                audio_bytes,
+                mime_type=mime_type,
+                model=stt_model if isinstance(stt_model, str) and stt_model.strip() else None,
+            )
+        except Exception as exc:
+            logger.error("STT failed for %s: %s", self.conn_id, exc)
+            await self.ws.send_str(make_error(msg_id, 502, str(exc)))
+            return
+
+        await self.ws.send_str(make_response(msg_id, {"text": text}))
 
     async def _handle_chat(self, session_key: str, text: str):
         """Stream a chat turn, emitting OpenClaw-format events."""
@@ -295,6 +556,8 @@ async def http_health(request: web.Request) -> web.Response:
         "hermes_api": hermes_ok,
         "hermes_version": hermes_status.get("version", "?"),
         "hermes_platform": hermes_status.get("platform", "?"),
+        "stt_provider": hermes.stt_provider,
+        "local_stt_model": hermes.local_stt_model,
     })
 
 async def http_root(request: web.Request) -> web.Response:
@@ -312,7 +575,7 @@ async def http_root(request: web.Request) -> web.Response:
 async def ws_handler(request: web.Request) -> web.StreamResponse:
     """Handle a WebSocket upgrade from the glasses (or test client)."""
     hermes: HermesClient = request.app["hermes_client"]
-    ws = web.WebSocketResponse(heartbeat=30, max_msg_size=2**20)
+    ws = web.WebSocketResponse(heartbeat=30, max_msg_size=2**22)
     await ws.prepare(request)
 
     conn_id = str(uuid.uuid4())[:8]
@@ -320,9 +583,29 @@ async def ws_handler(request: web.Request) -> web.StreamResponse:
     await conn.handle()
     return ws
 
-def create_app(hermes_url: str, hermes_key: str, hermes_model: str) -> web.Application:
+def create_app(
+    hermes_url: str,
+    hermes_key: str,
+    hermes_model: str,
+    hermes_stt_model: str,
+    stt_provider: str,
+    local_stt_model: str,
+    local_stt_device: str,
+    local_stt_compute_type: str,
+    local_stt_language: Optional[str],
+) -> web.Application:
     app = web.Application()
-    app["hermes_client"] = HermesClient(hermes_url, hermes_key, hermes_model)
+    app["hermes_client"] = HermesClient(
+        hermes_url,
+        hermes_key,
+        hermes_model,
+        hermes_stt_model,
+        stt_provider=stt_provider,
+        local_stt_model=local_stt_model,
+        local_stt_device=local_stt_device,
+        local_stt_compute_type=local_stt_compute_type,
+        local_stt_language=local_stt_language,
+    )
     app.router.add_get("/", http_root)
     app.router.add_get("/health", http_health)
     app.router.add_get("/ws", ws_handler)
@@ -332,7 +615,17 @@ def create_app(hermes_url: str, hermes_key: str, hermes_model: str) -> web.Appli
 
 async def main_async(args):
     from aiohttp import web
-    app = create_app(args.hermes_url, args.hermes_key, args.hermes_model)
+    app = create_app(
+        args.hermes_url,
+        args.hermes_key,
+        args.hermes_model,
+        args.hermes_stt_model,
+        args.stt_provider,
+        args.local_stt_model,
+        args.local_stt_device,
+        args.local_stt_compute_type,
+        args.local_stt_language,
+    )
 
     # Also keep the old health on port+1 for backwards compat
     health_port = args.port + 1
@@ -346,7 +639,14 @@ async def main_async(args):
     logger.info("Legacy health on http://0.0.0.0:%d/health", health_port)
 
     logger.info("HermesGlass Bridge on %s:%d (WS+HTTP)", args.host, args.port)
-    logger.info("Hermes API: %s (model: %s)", args.hermes_url, args.hermes_model)
+    logger.info(
+        "Hermes API: %s (chat model: %s, STT provider: %s, Hermes STT model: %s, local STT model: %s)",
+        args.hermes_url,
+        args.hermes_model,
+        args.stt_provider,
+        args.hermes_stt_model,
+        args.local_stt_model,
+    )
 
     runner2 = web.AppRunner(app)
     await runner2.setup()
@@ -361,6 +661,14 @@ def main():
     parser.add_argument("--hermes-url", default=os.getenv("HERMES_URL", DEFAULT_HERMES_URL))
     parser.add_argument("--hermes-key", default=os.getenv("API_SERVER_KEY", ""))
     parser.add_argument("--hermes-model", default=os.getenv("HERMES_MODEL", "hermes-agent"))
+    parser.add_argument("--hermes-stt-model", default=os.getenv("HERMES_STT_MODEL", "whisper-1"))
+    parser.add_argument("--stt-provider", choices=("auto", "hermes", "local"),
+                        default=os.getenv("HERMES_STT_PROVIDER", DEFAULT_STT_PROVIDER))
+    parser.add_argument("--local-stt-model", default=os.getenv("HERMES_LOCAL_STT_MODEL", DEFAULT_LOCAL_STT_MODEL))
+    parser.add_argument("--local-stt-device", default=os.getenv("HERMES_LOCAL_STT_DEVICE", DEFAULT_LOCAL_STT_DEVICE))
+    parser.add_argument("--local-stt-compute-type",
+                        default=os.getenv("HERMES_LOCAL_STT_COMPUTE_TYPE", DEFAULT_LOCAL_STT_COMPUTE_TYPE))
+    parser.add_argument("--local-stt-language", default=os.getenv("HERMES_LOCAL_STT_LANGUAGE") or None)
     parser.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"))
     args = parser.parse_args()
 

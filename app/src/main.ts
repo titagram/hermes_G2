@@ -4,15 +4,15 @@
  * A full-featured Even Hub app for Even Realities G2 smart glasses.
  *
  * Screens:
- *   1. CONFIG — On first launch, enter the Bridge WebSocket URL.
+ *   1. CONFIG — Mobile settings for Bridge URL, STT model, input source, and recording timeout.
  *      URL is persisted via bridge.setLocalStorage().
  *   2. CHAT — Main chat screen: connects to bridge, shows status,
  *      receives streaming responses, supports tap pagination.
- *   3. AUDIO — Mic capture ready (PCM stored, STT upgrade path).
+ *   3. AUDIO — Captures PCM, wraps WAV, transcribes through the bridge, then sends text to Hermes.
  *
  * Navigation:
  *   Tap        → context-dependent (next page / start mic)
- *   Double-tap → exit app from any screen
+ *   Double-tap → back from active view, exit from home/config
  *   Scroll up  → previous page
  *   Scroll down → next page
  */
@@ -21,9 +21,30 @@ import {
   waitForEvenAppBridge,
   TextContainerProperty,
   CreateStartUpPageContainer,
+  ListContainerProperty,
+  ListItemContainerProperty,
+  RebuildPageContainer,
   TextContainerUpgrade,
-  OsEventTypeList,
 } from '@evenrealities/even_hub_sdk'
+import { arrayBufferToBase64, createPcm16Wav, mergePcmChunks, PCM_SAMPLE_RATE, readTranscriptPayload } from './audio'
+import {
+  type AppConfig,
+  type ConnectionProfile,
+  type InputMode,
+  CONFIG_STORAGE_KEY,
+  DEFAULT_CONFIG,
+  LEGACY_BRIDGE_URL_KEY,
+  activeProfile,
+  deleteProfile,
+  isInputAllowed,
+  normalizeAppConfig,
+  parseStoredConfig,
+  serializeAppConfig,
+  upsertProfile,
+} from './config'
+import { normalizeHubEvent } from './events'
+import { type G2Surface, type SurfaceItem, formatHomeRow, normalizeSurface, paginateDetail } from './surface'
+import './styles.css'
 
 // ── Constants ────────────────────────────────────────────────────
 
@@ -35,28 +56,285 @@ const STATUS_H = 28
 const STATUS_Y = BODY_H + 4
 
 const CHARS_PER_PAGE = 220
-const STORAGE_KEY = 'hermesglass_bridge_url'
-const DEFAULT_URL = 'wss://titagram.tail005130.ts.net:8448/ws'
+const ENV_BRIDGE_URL = import.meta.env.VITE_BRIDGE_URL?.trim()
+const INITIAL_CONFIG = normalizeAppConfig({
+  ...DEFAULT_CONFIG,
+  bridgeUrl: ENV_BRIDGE_URL && ENV_BRIDGE_URL.length > 5 ? ENV_BRIDGE_URL : DEFAULT_CONFIG.bridgeUrl,
+})
 
 // ── State ────────────────────────────────────────────────────────
 
-type Screen = 'config' | 'chat' | 'connecting' | 'error'
+type Screen = 'config' | 'home' | 'detail' | 'confirm' | 'chat' | 'connecting' | 'error'
 type ChatState = 'idle' | 'listening' | 'thinking' | 'streaming' | 'showing' | 'error'
+type GlassesLayout = 'text' | 'list'
 
 let screen: Screen = 'config'
 let chatState: ChatState = 'idle'
-let bridgeUrl = DEFAULT_URL
+let appConfig = INITIAL_CONFIG
 let bridgeClient: HermesBridgeClient
+let currentSurface: G2Surface = normalizeSurface(null)
+let selectedHomeIndex = 0
+let pendingConfirmItem: SurfaceItem | null = null
 let responseText = ''
 let pages: string[] = []
 let currentPage = 0
 let connected = false
 let recording = false
-let pcmChunks: ArrayBuffer[] = []
+let glassesLayout: GlassesLayout = 'text'
+let currentStatusContent = 'Loading...'
+let pcmChunks: Uint8Array[] = []
 let cleanedUp = false
 let renderTimer: number | null = null
-let configBuffer = ''
-const configUrl = DEFAULT_URL
+let recordingTimer: number | null = null
+let audioAttemptId = 0
+let audioControlInFlight = 0
+let unsubscribeEvents: (() => void) | null = null
+let pendingBodyContent: string | null = null
+let bridgeQueue: Promise<unknown> = Promise.resolve()
+
+// ── WebView UI ──────────────────────────────────────────────────
+
+const appRoot = document.querySelector<HTMLDivElement>('#app')
+
+function initWebView() {
+  if (!appRoot) return
+  appRoot.innerHTML = `
+    <main class="app-shell">
+      <header class="app-header">
+        <div>
+          <h1 class="app-title">HermesGlass</h1>
+          <p class="app-subtitle">Even Realities G2 bridge for Hermes Agent</p>
+        </div>
+        <div id="webState" class="state-pill">Starting</div>
+      </header>
+
+      <section class="app-main">
+        <section class="panel">
+          <div class="panel-body">
+            <div class="profile-row">
+              <div>
+                <label class="field-label" for="profileSelect">Profile</label>
+                <select id="profileSelect" class="config-input"></select>
+              </div>
+              <div>
+                <label class="field-label" for="profileNameInput">Profile name</label>
+                <input id="profileNameInput" class="config-input" autocomplete="off" spellcheck="false" />
+              </div>
+            </div>
+
+            <label class="field-label" for="bridgeUrlInput">Bridge WebSocket URL</label>
+            <input id="bridgeUrlInput" class="config-input" autocomplete="off" spellcheck="false" />
+
+            <label class="field-label field-spaced" for="bridgeTokenInput">Token</label>
+            <input id="bridgeTokenInput" class="config-input" autocomplete="off" spellcheck="false" type="password" />
+
+            <div class="settings-grid">
+              <div>
+                <label class="field-label" for="sttModelInput">STT model</label>
+                <input id="sttModelInput" class="config-input" autocomplete="off" spellcheck="false" />
+              </div>
+              <div>
+                <label class="field-label" for="maxRecordingSecondsInput">Recording seconds</label>
+                <input id="maxRecordingSecondsInput" class="config-input" type="number" min="3" max="60" step="1" />
+              </div>
+              <div>
+                <label class="field-label" for="inputModeSelect">Input source</label>
+                <select id="inputModeSelect" class="config-input">
+                  <option value="all">Ring and temples</option>
+                  <option value="ring">Ring only</option>
+                  <option value="temples">Temples only</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="button-row">
+              <button id="newProfileButton" class="button secondary" type="button">New Profile</button>
+              <button id="saveProfileButton" class="button secondary" type="button">Save Profile</button>
+              <button id="deleteProfileButton" class="button secondary danger" type="button">Delete Profile</button>
+              <button id="connectButton" class="button" type="button">Save & Connect</button>
+              <button id="testBridgeButton" class="button secondary" type="button">Test Bridge</button>
+              <button id="testPromptButton" class="button secondary" type="button" disabled>Send Test Prompt</button>
+            </div>
+          </div>
+        </section>
+
+        <section class="status-grid">
+          <div class="metric">
+            <p class="metric-label">Glasses</p>
+            <p id="webDisplayStatus" class="metric-value">Waiting for Even Hub bridge</p>
+          </div>
+          <div class="metric">
+            <p class="metric-label">Hermes</p>
+            <p id="webConnectionStatus" class="metric-value">Not connected</p>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-body">
+            <p class="metric-label">Display Preview</p>
+            <pre id="webPreview" class="preview">HermesGlass is starting...</pre>
+          </div>
+        </section>
+      </section>
+    </main>
+  `
+
+  setWebConfig(appConfig)
+
+  document.querySelector<HTMLButtonElement>('#connectButton')
+    ?.addEventListener('click', () => connectToConfiguredBridge().catch(reportFatal))
+  document.querySelector<HTMLButtonElement>('#newProfileButton')
+    ?.addEventListener('click', () => createNewProfileFromForm().catch(reportFatal))
+  document.querySelector<HTMLButtonElement>('#saveProfileButton')
+    ?.addEventListener('click', () => saveProfileFromForm(false).catch(reportFatal))
+  document.querySelector<HTMLButtonElement>('#deleteProfileButton')
+    ?.addEventListener('click', () => deleteActiveProfileFromForm().catch(reportFatal))
+  document.querySelector<HTMLButtonElement>('#testBridgeButton')
+    ?.addEventListener('click', () => testBridgeConfiguration().catch(reportFatal))
+  document.querySelector<HTMLButtonElement>('#testPromptButton')
+    ?.addEventListener('click', () => sendTestPrompt().catch(reportFatal))
+  document.querySelector<HTMLSelectElement>('#profileSelect')
+    ?.addEventListener('change', () => switchProfileFromSelect().catch(reportFatal))
+}
+
+function setText(selector: string, value: string) {
+  const node = document.querySelector<HTMLElement>(selector)
+  if (node) node.textContent = value
+}
+
+function setWebState(state: string) {
+  setText('#webState', state)
+}
+
+function setWebConnectionStatus(status: string) {
+  setText('#webConnectionStatus', status)
+}
+
+function setWebDisplayStatus(status: string) {
+  setText('#webDisplayStatus', status)
+}
+
+function setWebPreview(content: string) {
+  setText('#webPreview', content)
+}
+
+function setWebBridgeUrl(url: string) {
+  const input = document.querySelector<HTMLInputElement>('#bridgeUrlInput')
+  if (input && input.value !== url) input.value = url
+}
+
+function readWebConfig(): AppConfig {
+  const seconds = document.querySelector<HTMLInputElement>('#maxRecordingSecondsInput')?.value
+  const profile = readProfileForm()
+  const next = upsertProfile(appConfig, profile, true)
+  return normalizeAppConfig({
+    ...next,
+    bridgeUrl: document.querySelector<HTMLInputElement>('#bridgeUrlInput')?.value,
+    bridgeToken: document.querySelector<HTMLInputElement>('#bridgeTokenInput')?.value,
+    sttModel: document.querySelector<HTMLInputElement>('#sttModelInput')?.value,
+    maxRecordingMs: seconds ? Number(seconds) * 1000 : undefined,
+    inputMode: document.querySelector<HTMLSelectElement>('#inputModeSelect')?.value,
+  })
+}
+
+function setWebConfig(config: AppConfig) {
+  renderProfileOptions(config)
+  const bridgeUrlInput = document.querySelector<HTMLInputElement>('#bridgeUrlInput')
+  const bridgeTokenInput = document.querySelector<HTMLInputElement>('#bridgeTokenInput')
+  const profileNameInput = document.querySelector<HTMLInputElement>('#profileNameInput')
+  const sttModelInput = document.querySelector<HTMLInputElement>('#sttModelInput')
+  const maxRecordingInput = document.querySelector<HTMLInputElement>('#maxRecordingSecondsInput')
+  const inputModeSelect = document.querySelector<HTMLSelectElement>('#inputModeSelect')
+  const selected = activeProfile(config)
+
+  if (profileNameInput) profileNameInput.value = selected.name
+  if (bridgeUrlInput) bridgeUrlInput.value = selected.url
+  if (bridgeTokenInput) bridgeTokenInput.value = selected.token
+  if (sttModelInput) sttModelInput.value = config.sttModel
+  if (maxRecordingInput) maxRecordingInput.value = String(Math.round(config.maxRecordingMs / 1000))
+  if (inputModeSelect) inputModeSelect.value = config.inputMode
+}
+
+function renderProfileOptions(config: AppConfig) {
+  const select = document.querySelector<HTMLSelectElement>('#profileSelect')
+  if (!select) return
+  select.innerHTML = config.profiles
+    .map((profile) => `<option value="${escapeHtml(profile.id)}">${escapeHtml(profile.name)}</option>`)
+    .join('')
+  select.value = config.activeProfileId
+}
+
+function readProfileForm(): ConnectionProfile {
+  const existing = activeProfile(appConfig)
+  return {
+    id: existing.id,
+    name: document.querySelector<HTMLInputElement>('#profileNameInput')?.value.trim() || existing.name,
+    url: document.querySelector<HTMLInputElement>('#bridgeUrlInput')?.value.trim() || existing.url,
+    token: document.querySelector<HTMLInputElement>('#bridgeTokenInput')?.value.trim() || '',
+  }
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (char) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;',
+  }[char] ?? char))
+}
+
+async function switchProfileFromSelect() {
+  const selectedId = document.querySelector<HTMLSelectElement>('#profileSelect')?.value
+  if (!selectedId) return
+  appConfig = normalizeAppConfig({ ...appConfig, activeProfileId: selectedId })
+  setWebConfig(appConfig)
+  await saveAppConfig(appConfig)
+}
+
+async function createNewProfileFromForm() {
+  const id = `profile-${Date.now()}`
+  const profile: ConnectionProfile = {
+    id,
+    name: 'New Profile',
+    url: activeProfile(appConfig).url,
+    token: '',
+  }
+  appConfig = upsertProfile(appConfig, profile, true)
+  setWebConfig(appConfig)
+  await saveAppConfig(appConfig)
+}
+
+async function saveProfileFromForm(connectAfterSave: boolean) {
+  appConfig = upsertProfile(appConfig, readProfileForm(), true)
+  setWebConfig(appConfig)
+  await saveAppConfig(appConfig)
+  if (connectAfterSave) await showChatScreen()
+}
+
+async function deleteActiveProfileFromForm() {
+  appConfig = deleteProfile(appConfig, appConfig.activeProfileId)
+  setWebConfig(appConfig)
+  await saveAppConfig(appConfig)
+}
+
+function setWebConnected(isConnected: boolean) {
+  const button = document.querySelector<HTMLButtonElement>('#testPromptButton')
+  if (button) button.disabled = !isConnected
+}
+
+function reportFatal(err: unknown) {
+  console.error('[HG] Fatal:', err)
+  setWebState('Error')
+  setWebDisplayStatus('Startup error')
+  setWebConnectionStatus(err instanceof Error ? err.message : String(err))
+}
+
+function enqueueBridgeCall<T>(operation: () => Promise<T>): Promise<T> {
+  const next = bridgeQueue.then(operation, operation)
+  bridgeQueue = next.catch(() => {})
+  return next
+}
 
 // Even Hub bridge (lazy)
 let _bridge: any = null
@@ -70,11 +348,17 @@ async function bridge() {
 class HermesBridgeClient {
   private ws: WebSocket | null = null
   private url: string
+  private token: string
   private msgId = 0
   private shouldClose = false
   private reconnectTimer: number | null = null
   private reconnectInterval = 1000
   private maxReconnectInterval = 30000
+  private pending = new Map<string, {
+    resolve: (payload: any) => void
+    reject: (error: Error) => void
+    timer: number
+  }>()
 
   onConnect: (() => void) | null = null
   onDisconnect: (() => void) | null = null
@@ -82,7 +366,10 @@ class HermesBridgeClient {
   onFinal: ((text: string) => void) | null = null
   onError: ((msg: string) => void) | null = null
 
-  constructor(url: string) { this.url = url }
+  constructor(url: string, token = '') {
+    this.url = url
+    this.token = token
+  }
 
   connect(): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -110,6 +397,11 @@ class HermesBridgeClient {
   disconnect() {
     this.shouldClose = true
     if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null }
+    for (const [id, pending] of this.pending) {
+      clearTimeout(pending.timer)
+      pending.reject(new Error('Disconnected'))
+      this.pending.delete(id)
+    }
     this.ws?.close(); this.ws = null
   }
 
@@ -118,6 +410,7 @@ class HermesBridgeClient {
       minProtocol: 3, maxProtocol: 3,
       client: { id: 'hermes-glass', version: '1.0.0', platform: 'web', mode: 'operator' },
       role: 'operator', scopes: ['operator.read', 'operator.write'],
+      token: this.token,
       caps: [], commands: [], permissions: {}, locale: 'en-US', userAgent: 'hermes-glass/1.0.0',
     }})
   }
@@ -127,8 +420,15 @@ class HermesBridgeClient {
       if (!line.trim()) continue
       try {
         const msg = JSON.parse(line)
-        if (msg.type === 'res' && msg.payload?.type === 'hello-ok') {
-          console.log('[HG] Handshake ok')
+        if (msg.type === 'res') {
+          if (msg.payload?.type === 'hello-ok') console.log('[HG] Handshake ok')
+          const pending = this.pending.get(msg.id)
+          if (pending) {
+            clearTimeout(pending.timer)
+            this.pending.delete(msg.id)
+            if (msg.ok) pending.resolve(msg.payload ?? {})
+            else pending.reject(new Error(msg.error?.message || 'Bridge request failed'))
+          }
         } else if (msg.type === 'event') {
           if (msg.event === 'chat.event') {
             const p = msg.payload
@@ -143,6 +443,53 @@ class HermesBridgeClient {
 
   sendChat(message: string, sessionKey = 'g2-hermes') {
     this.send({ type: 'req', id: this.genId(), method: 'chat.send', params: { sessionKey, message, idempotencyKey: `s_${Date.now()}` } })
+  }
+
+  async getBridgeCapabilities(): Promise<Record<string, unknown>> {
+    return this.sendRequest('bridge.capabilities', {}, 10000)
+  }
+
+  async getSurface(): Promise<G2Surface> {
+    return normalizeSurface(await this.sendRequest('g2.surface.get', {}, 10000))
+  }
+
+  async refreshSurface(): Promise<G2Surface> {
+    return normalizeSurface(await this.sendRequest('g2.surface.refresh', {}, 10000))
+  }
+
+  async runAction(id: string): Promise<Record<string, unknown>> {
+    return this.sendRequest('g2.action.run', { id, sessionKey: 'g2-hermes' }, 30000)
+  }
+
+  async getBootstrapStatus(): Promise<Record<string, unknown>> {
+    return this.sendRequest('g2.bootstrap.status', {}, 10000)
+  }
+
+  async transcribeAudio(audioBase64: string, sttModel: string): Promise<string> {
+    const payload = await this.sendRequest('audio.transcribe', {
+      audioBase64,
+      mimeType: 'audio/wav',
+      sampleRate: PCM_SAMPLE_RATE,
+      sttModel,
+    }, 60000)
+    return readTranscriptPayload(payload)
+  }
+
+  private sendRequest(method: string, params: any, timeoutMs = 30000): Promise<any> {
+    return new Promise((resolve, reject) => {
+      if (this.ws?.readyState !== WebSocket.OPEN) {
+        reject(new Error('Bridge is not connected'))
+        return
+      }
+
+      const id = this.genId()
+      const timer = window.setTimeout(() => {
+        this.pending.delete(id)
+        reject(new Error(`${method} timed out`))
+      }, timeoutMs)
+      this.pending.set(id, { resolve, reject, timer })
+      this.send({ type: 'req', id, method, params })
+    })
   }
 
   private send(obj: any) {
@@ -190,47 +537,211 @@ function paginate(text: string): string[] {
 
 // ── Display helpers ──────────────────────────────────────────────
 
+function buildTextPage(bodyContent: string, statusContent: string, capture = 1) {
+  const body = new TextContainerProperty({
+    xPosition: 0, yPosition: 0, width: DISPLAY_W, height: BODY_H,
+    borderWidth: 0, borderColor: 5, paddingLength: BODY_PAD,
+    containerID: 1, containerName: 'body',
+    content: bodyContent,
+    isEventCapture: capture,
+  })
+  const status = new TextContainerProperty({
+    xPosition: 0, yPosition: STATUS_Y, width: DISPLAY_W, height: STATUS_H,
+    borderWidth: 0, borderColor: 5, paddingLength: 4,
+    containerID: 2, containerName: 'status',
+    content: statusContent,
+    isEventCapture: capture ? 0 : 1,
+  })
+  return { containerTotalNum: 2, textObject: [body, status] }
+}
+
+async function rebuildTextLayout(bodyContent: string, statusContent: string) {
+  pendingBodyContent = null
+  if (renderTimer !== null) {
+    clearTimeout(renderTimer)
+    renderTimer = null
+  }
+  currentStatusContent = statusContent
+  glassesLayout = 'text'
+  setWebPreview(bodyContent)
+  setWebDisplayStatus(statusContent)
+  await enqueueBridgeCall(async () => {
+    const b = await bridge()
+    await b.rebuildPageContainer(new RebuildPageContainer(buildTextPage(bodyContent, statusContent)))
+  })
+}
+
 async function updateBody(content: string) {
+  if (glassesLayout !== 'text') {
+    await rebuildTextLayout(content, currentStatusContent)
+    return
+  }
+  pendingBodyContent = content
+  setWebPreview(content)
   if (renderTimer !== null) return
   renderTimer = window.setTimeout(async () => {
+    const nextContent = pendingBodyContent ?? ''
+    pendingBodyContent = null
     renderTimer = null
-    const b = await bridge()
-    await b.textContainerUpgrade(new TextContainerUpgrade({ containerID: 1, containerName: 'body', content }))
+    await enqueueBridgeCall(async () => {
+      const b = await bridge()
+      await b.textContainerUpgrade(new TextContainerUpgrade({
+        containerID: 1,
+        containerName: 'body',
+        contentOffset: 0,
+        contentLength: 0,
+        content: nextContent,
+      }))
+    })
   }, 120)
 }
 
 async function updateStatus(content: string) {
-  const b = await bridge()
-  await b.textContainerUpgrade(new TextContainerUpgrade({ containerID: 2, containerName: 'status', content }))
+  currentStatusContent = content
+  if (glassesLayout !== 'text') {
+    setWebDisplayStatus(content)
+    return
+  }
+  setWebDisplayStatus(content)
+  await enqueueBridgeCall(async () => {
+    const b = await bridge()
+    await b.textContainerUpgrade(new TextContainerUpgrade({
+      containerID: 2,
+      containerName: 'status',
+      contentOffset: 0,
+      contentLength: 0,
+      content,
+    }))
+  })
+}
+
+function buildHomeText(surface: G2Surface): string {
+  if (surface.items.length === 0) return 'Hermes\n\nNo actions available.'
+  return surface.items
+    .map((item, index) => `${index === selectedHomeIndex ? '>' : ' '} ${formatHomeRow(item)}`)
+    .join('\n')
+}
+
+async function renderHomeSurface(surface: G2Surface) {
+  screen = 'home'
+  chatState = 'idle'
+  currentSurface = surface
+  selectedHomeIndex = Math.min(selectedHomeIndex, Math.max(surface.items.length - 1, 0))
+  pendingConfirmItem = null
+  setWebState('Home')
+  setWebConnectionStatus(`Connected to ${activeProfile(appConfig).name}`)
+  setWebConnected(true)
+
+  const rows = surface.items.map((item) => formatHomeRow(item))
+  const status = `${surface.status.agent} | press: select | double: exit`
+  currentStatusContent = status
+  setWebPreview(buildHomeText(surface))
+  setWebDisplayStatus(status)
+
+  if (rows.length === 0) {
+    await rebuildTextLayout('Hermes\n\nNo actions available.', status)
+    return
+  }
+
+  try {
+    await enqueueBridgeCall(async () => {
+      const b = await bridge()
+      await b.rebuildPageContainer(new RebuildPageContainer({
+        containerTotalNum: 2,
+        listObject: [new ListContainerProperty({
+          xPosition: 0, yPosition: 0, width: DISPLAY_W, height: BODY_H,
+          borderWidth: 0, borderColor: 5, paddingLength: BODY_PAD,
+          containerID: 1, containerName: 'home',
+          itemContainer: new ListItemContainerProperty({
+            itemCount: rows.length,
+            itemWidth: 0,
+            isItemSelectBorderEn: 1,
+            itemName: rows,
+          }),
+          isEventCapture: 1,
+        })],
+        textObject: [new TextContainerProperty({
+          xPosition: 0, yPosition: STATUS_Y, width: DISPLAY_W, height: STATUS_H,
+          borderWidth: 0, borderColor: 5, paddingLength: 4,
+          containerID: 2, containerName: 'status',
+          content: status,
+          isEventCapture: 0,
+        })],
+      }))
+    })
+    glassesLayout = 'list'
+  } catch (err) {
+    console.warn('[HG] Native list render failed, using text fallback:', err)
+    await rebuildTextLayout(buildHomeText(surface), status)
+  }
+}
+
+async function refreshSurfaceAndRender() {
+  if (!bridgeClient || !connected) return
+  const surface = await bridgeClient.getSurface()
+  await renderHomeSurface(surface)
+}
+
+async function updateBodyIfGlassesReady(content: string) {
+  if (audioControlInFlight > 0) {
+    setWebPreview(content)
+    return
+  }
+  await updateBody(content)
+}
+
+async function updateStatusIfGlassesReady(content: string) {
+  if (audioControlInFlight > 0) {
+    setWebDisplayStatus(content)
+    return
+  }
+  await updateStatus(content)
 }
 
 async function showConfigScreen() {
   screen = 'config'
-  const b = await bridge()
-  const saved = await b.getLocalStorage(STORAGE_KEY) || DEFAULT_URL
-  const url = saved.length > 5 ? saved : DEFAULT_URL
+  setWebState('Setup')
+  setWebConfig(appConfig)
+  setWebConnectionStatus('Ready to connect')
   await updateBody(
-    `HERMESGLASS SETUP\n\nBridge URL:\n${url}\n\nTap: connect | Scroll: exit | Double-tap: exit`
+    `HERMESGLASS SETUP\n\nConfigure on phone screen.\nBridge:\n${appConfig.bridgeUrl}\n\nTap/ring: connect | Double-tap: exit`
   )
-  await updateStatus(`Bridge: ${url}`)
+  await updateStatus(`Config | ${appConfig.inputMode} | ${Math.round(appConfig.maxRecordingMs / 1000)}s`)
 }
 
 async function showChatScreen() {
-  screen = 'chat'
-  await updateBody('HermesGlass\n\nConnecting...')
+  screen = 'connecting'
+  chatState = 'idle'
+  const profile = activeProfile(appConfig)
+  setWebState('Connecting')
+  setWebConnectionStatus(`Connecting to ${profile.name}`)
+  setWebConnected(false)
+  await rebuildTextLayout('HermesGlass\n\nConnecting...', 'Connecting...')
   await updateStatus('Connecting...')
 
-  bridgeClient = new HermesBridgeClient(bridgeUrl)
+  bridgeClient?.disconnect()
+  bridgeClient = new HermesBridgeClient(profile.url, profile.token)
 
   bridgeClient.onConnect = async () => {
     connected = true
-    await updateBody('HermesGlass\n\nConnected to Hermes.\nLong-press right temple to talk.\nTap to send query.\nDouble-tap to exit.')
-    await updateStatus('Connected | tap: ask | double-tap: exit')
+    setWebState('Connected')
+    setWebConnectionStatus(`Connected to ${profile.name}`)
+    setWebConnected(true)
+    try {
+      const surface = await bridgeClient.getSurface()
+      await renderHomeSurface(surface)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      await rebuildTextLayout(`HermesGlass\n\nConnected, but surface failed:\n${cleanForG2(msg)}`, 'Surface error')
+    }
   }
 
   bridgeClient.onDisconnect = async () => {
     connected = false
-    await updateBody('HermesGlass\n\nDisconnected.\nReconnecting...')
+    setWebState('Reconnecting')
+    setWebConnectionStatus('Disconnected. Reconnecting...')
+    setWebConnected(false)
+    await rebuildTextLayout('HermesGlass\n\nDisconnected.\nReconnecting...', 'Reconnecting...')
     await updateStatus('Reconnecting...')
   }
 
@@ -239,6 +750,7 @@ async function showChatScreen() {
     const clean = cleanForG2(text)
     pages = paginate(clean)
     currentPage = 0
+    setWebState('Streaming')
     await updateBody(pages[0] || clean)
   }
 
@@ -249,14 +761,18 @@ async function showChatScreen() {
     currentPage = 0
     await updateBody(pages[0] || '(no response)')
     chatState = pages.length > 1 ? 'showing' : 'idle'
+    setWebState('Connected')
     const s = pages.length > 1
-      ? `Page 1/${pages.length} | tap: next | double-tap: exit`
-      : 'Idle | tap: ask | double-tap: exit'
+      ? `Page 1/${pages.length} | tap: next | double: back`
+      : 'Idle | tap: ask | double: back'
     await updateStatus(s)
   }
 
   bridgeClient.onError = async (msg: string) => {
     chatState = 'idle'
+    setWebState('Error')
+    setWebConnectionStatus(msg)
+    setWebConnected(false)
     await updateBody(`HermesGlass\n\nError: ${msg}`)
     await updateStatus('Error | tap: retry')
   }
@@ -268,61 +784,412 @@ async function showChatScreen() {
   })
 }
 
+async function connectToConfiguredBridge() {
+  const nextConfig = readWebConfig()
+  await saveAppConfig(nextConfig)
+  await showChatScreen()
+}
+
+async function saveAppConfig(nextConfig: AppConfig) {
+  const b = await bridge()
+  appConfig = normalizeAppConfig(nextConfig)
+  setWebConfig(appConfig)
+  await b.setLocalStorage(CONFIG_STORAGE_KEY, serializeAppConfig(appConfig))
+  await b.setLocalStorage(LEGACY_BRIDGE_URL_KEY, appConfig.bridgeUrl)
+}
+
+async function loadAppConfig(b: any): Promise<AppConfig> {
+  const stored = await b.getLocalStorage(CONFIG_STORAGE_KEY)
+  if (stored) return parseStoredConfig(stored)
+
+  const legacyBridgeUrl = await b.getLocalStorage(LEGACY_BRIDGE_URL_KEY)
+  if (legacyBridgeUrl) return normalizeAppConfig({ ...INITIAL_CONFIG, bridgeUrl: legacyBridgeUrl })
+  return INITIAL_CONFIG
+}
+
+function inputModeLabel(mode: InputMode): string {
+  if (mode === 'ring') return 'ring only'
+  if (mode === 'temples') return 'temples only'
+  return 'ring+temples'
+}
+
+async function testBridgeConfiguration() {
+  const nextConfig = readWebConfig()
+  await saveAppConfig(nextConfig)
+  const profile = activeProfile(appConfig)
+
+  setWebState('Testing')
+  setWebConnectionStatus('Testing bridge...')
+  await updateBody(`HermesGlass\n\nTesting bridge:\n${profile.name}\n${profile.url}`)
+  await updateStatus('Testing bridge...')
+
+  const testClient = new HermesBridgeClient(profile.url, profile.token)
+  try {
+    await testClient.connect()
+    const capabilities = await testClient.getBridgeCapabilities()
+    if (capabilities.audioTranscribe === true && capabilities.g2Surface === true) {
+      setWebState('Ready')
+      setWebConnectionStatus('Bridge connected. G2 surface and STT route available.')
+      await updateBody('HermesGlass\n\nBridge OK.\nG2 surface available.\nSave & Connect to start.')
+      await updateStatus('Bridge OK | G2 ready')
+    } else {
+      setWebState('Bridge Old')
+      setWebConnectionStatus('Bridge connected, but G2 surface or audio.transcribe is not available.')
+      await updateBody('HermesGlass\n\nBridge connected, but G2 surface is not available.\nRestart the updated bridge server.')
+      await updateStatus('Bridge old | update server')
+    }
+  } catch (err) {
+    setWebState('Bridge Error')
+    const msg = err instanceof Error ? err.message : String(err)
+    setWebConnectionStatus(msg)
+    await updateBody(`HermesGlass\n\nBridge test failed:\n${cleanForG2(msg)}`)
+    await updateStatus('Bridge test failed')
+  } finally {
+    testClient.disconnect()
+  }
+}
+
+async function sendTestPrompt() {
+  if (!bridgeClient || !connected) {
+    await connectToConfiguredBridge()
+  }
+  chatState = 'thinking'
+  setWebState('Thinking')
+  await updateBody('HermesGlass\n\nThinking...')
+  await updateStatus('Thinking...')
+  bridgeClient.sendChat('Say hello in one short sentence.')
+}
+
+async function activateHomeIndex(index: number) {
+  const item = currentSurface.items[index]
+  if (!item) return
+  selectedHomeIndex = index
+
+  if (item.type === 'voice') {
+    await startVoiceRecording()
+    return
+  }
+
+  if (item.type === 'data') {
+    await showDetailForItem(item)
+    return
+  }
+
+  if (item.action?.confirm || item.action?.risk === 'dangerous' || item.action?.risk === 'confirm') {
+    await showConfirmForItem(item)
+    return
+  }
+
+  await runSurfaceAction(item)
+}
+
+async function showDetailForItem(item: SurfaceItem) {
+  screen = 'detail'
+  chatState = 'showing'
+  pages = paginateDetail(item, CHARS_PER_PAGE)
+  currentPage = 0
+  await rebuildTextLayout(pages[0] || '(no details)', `Detail ${currentPage + 1}/${pages.length} | double: back`)
+}
+
+async function showConfirmForItem(item: SurfaceItem) {
+  screen = 'confirm'
+  pendingConfirmItem = item
+  await rebuildTextLayout(
+    `Confirm action\n\n${item.label}\n${item.summary}\n\nPress to run.\nDouble press to go back.`,
+    'Confirm | press: run'
+  )
+}
+
+async function runSurfaceAction(item: SurfaceItem) {
+  if (!bridgeClient || !connected) {
+    await connectToConfiguredBridge()
+  }
+  screen = 'chat'
+  chatState = 'thinking'
+  setWebState('Running')
+  await rebuildTextLayout(`${item.label}\n\nRunning...`, 'Running action...')
+
+  try {
+    const result = await bridgeClient.runAction(item.id)
+    if (result.state === 'detail' && result.item && typeof result.item === 'object') {
+      await showDetailForItem(normalizeSurface({ items: [result.item] }).items[0])
+    } else if (result.state === 'voice') {
+      await startVoiceRecording()
+    } else if (result.accepted !== true) {
+      await rebuildTextLayout(`${item.label}\n\nAction returned without output.`, 'Action complete')
+      chatState = 'idle'
+    }
+  } catch (err) {
+    chatState = 'idle'
+    screen = 'error'
+    const msg = err instanceof Error ? err.message : String(err)
+    await rebuildTextLayout(`Action failed:\n${cleanForG2(msg)}`, 'Error | double: back')
+  }
+}
+
+async function returnHome() {
+  await cancelVoiceRecording()
+  if (connected && bridgeClient) {
+    try {
+      await refreshSurfaceAndRender()
+      return
+    } catch (err) {
+      console.warn('[HG] Surface refresh failed while returning home:', err)
+    }
+  }
+  await showConfigScreen()
+}
+
+function appendPcmChunk(pcm: unknown) {
+  if (pcm instanceof Uint8Array) {
+    pcmChunks.push(new Uint8Array(pcm))
+  } else if (pcm instanceof ArrayBuffer) {
+    pcmChunks.push(new Uint8Array(pcm.slice(0)))
+  } else if (Array.isArray(pcm)) {
+    pcmChunks.push(Uint8Array.from(pcm))
+  }
+}
+
+async function cancelVoiceRecording() {
+  if (!recording) return
+  recording = false
+  audioAttemptId++
+  clearRecordingTimer()
+  pcmChunks = []
+  try {
+    const b = await bridge()
+    runAudioControl(b, false, 2500).catch(() => {})
+  } catch (err) {
+    console.warn('[HG] Audio cancel failed:', err)
+  }
+}
+
+function clearRecordingTimer() {
+  if (recordingTimer !== null) {
+    clearTimeout(recordingTimer)
+    recordingTimer = null
+  }
+}
+
+function runAudioControl(b: any, enabled: boolean, timeoutMs: number): Promise<boolean> {
+  audioControlInFlight++
+  return new Promise((resolve) => {
+    let settled = false
+    let released = false
+    const releaseInFlight = () => {
+      if (released) return
+      released = true
+      audioControlInFlight = Math.max(0, audioControlInFlight - 1)
+    }
+    const finish = (opened: boolean) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      releaseInFlight()
+      resolve(opened)
+    }
+    const timer = window.setTimeout(() => {
+      console.warn(`[HG] audioControl(${enabled}) timed out`)
+      finish(false)
+    }, timeoutMs)
+
+    Promise.resolve()
+      .then(() => b.audioControl(enabled))
+      .then((opened) => {
+        finish(Boolean(opened))
+      })
+      .catch((err) => {
+        console.warn(`[HG] audioControl(${enabled}) failed:`, err)
+        finish(false)
+      })
+  })
+}
+
+async function startVoiceRecording() {
+  if (!bridgeClient || !connected) {
+    await connectToConfiguredBridge()
+  }
+
+  const b = await bridge()
+  pcmChunks = []
+  recording = true
+  screen = 'chat'
+  chatState = 'listening'
+  setWebState('Listening')
+  await updateBody('HermesGlass\n\nListening...\nTap ring or temple again to send.')
+  await updateStatus('Listening | tap/ring: send')
+
+  clearRecordingTimer()
+  recordingTimer = window.setTimeout(() => {
+    stopVoiceRecordingAndSend().catch(reportFatal)
+  }, appConfig.maxRecordingMs)
+
+  const token = ++audioAttemptId
+  window.setTimeout(() => {
+    if (token !== audioAttemptId || !recording) return
+    runAudioControl(b, true, 5000)
+      .then(async (opened) => {
+        if (token !== audioAttemptId || !recording) {
+          if (opened) runAudioControl(b, false, 2500).catch(() => {})
+          return
+        }
+
+        if (!opened) {
+          recording = false
+          clearRecordingTimer()
+          chatState = 'idle'
+          setWebState('Connected')
+          await updateBodyIfGlassesReady('HermesGlass\n\nMicrophone did not open.\nTap ring or temple to try again.')
+          await updateStatusIfGlassesReady('Mic error | tap/ring: retry')
+        }
+      })
+      .catch(reportFatal)
+  }, 200)
+}
+
+async function stopVoiceRecordingAndSend() {
+  if (!recording) return
+  recording = false
+  audioAttemptId++
+  clearRecordingTimer()
+
+  const b = await bridge()
+  runAudioControl(b, false, 2500).catch(() => {})
+
+  const pcm = mergePcmChunks(pcmChunks)
+  pcmChunks = []
+  if (pcm.byteLength < 1600) {
+    chatState = 'idle'
+    setWebState('Connected')
+    await updateBodyIfGlassesReady('HermesGlass\n\nNo voice captured.\nTap ring or temple to try again.')
+    await updateStatusIfGlassesReady('Idle | tap/ring: speak')
+    return
+  }
+
+  chatState = 'thinking'
+  setWebState('Transcribing')
+  await updateBodyIfGlassesReady('HermesGlass\n\nTranscribing voice...')
+  await updateStatusIfGlassesReady('Transcribing...')
+
+  try {
+    const wav = createPcm16Wav(pcm)
+    const transcript = await bridgeClient.transcribeAudio(arrayBufferToBase64(wav), appConfig.sttModel)
+    if (!transcript) throw new Error('Empty transcript')
+
+    setWebState('Thinking')
+    await updateBodyIfGlassesReady(`You: ${cleanForG2(transcript)}\n\nThinking...`)
+    await updateStatusIfGlassesReady('Thinking...')
+    bridgeClient.sendChat(transcript)
+  } catch (err) {
+    chatState = 'idle'
+    setWebState('STT Error')
+    const msg = err instanceof Error ? err.message : String(err)
+    await updateBodyIfGlassesReady(`HermesGlass\n\nVoice transcription failed:\n${cleanForG2(msg)}\n\nTap ring or temple to try again.`)
+    await updateStatusIfGlassesReady('STT error | tap/ring: retry')
+  }
+}
+
 // ── Event handler ────────────────────────────────────────────────
 
 async function handleEvent(event: any) {
-  const sysType = event.sysEvent?.eventType ?? null
-  const textType = event.textEvent?.eventType ?? null
+  const gesture = normalizeHubEvent(event)
 
-  // Double-tap = exit from anywhere
-  if (sysType === OsEventTypeList.DOUBLE_CLICK_EVENT || textType === OsEventTypeList.DOUBLE_CLICK_EVENT) {
+  // Double-tap = back from sub-screens, exit from home/config.
+  if (gesture.isDoubleTap) {
+    if (screen !== 'home' && screen !== 'config') {
+      await returnHome()
+      return
+    }
     const b = await bridge()
     b.shutDownPageContainer(1)
     return
   }
 
   // Audio PCM
-  const pcm = event.audioEvent?.audioPcm
+  const pcm = gesture.audioPcm
   if (pcm && recording) {
-    if (pcm instanceof ArrayBuffer) pcmChunks.push(pcm)
-    else if (pcm instanceof Uint8Array) pcmChunks.push(pcm.buffer as ArrayBuffer)
+    appendPcmChunk(pcm)
     return
   }
 
-  const isTap = sysType === OsEventTypeList.CLICK_EVENT
-  const isScrollDown = textType === OsEventTypeList.SCROLL_BOTTOM_EVENT
-  const isScrollUp = textType === OsEventTypeList.SCROLL_TOP_EVENT
-
   if (screen === 'config') {
     // Config screen: tap = save URL and connect
-    if (isTap || isScrollDown) {
-      const b = await bridge()
-      bridgeUrl = configUrl
-      await b.setLocalStorage(STORAGE_KEY, bridgeUrl)
-      await showChatScreen()
+    if (gesture.isTap || gesture.isScrollDown) await connectToConfiguredBridge()
+    return
+  }
+
+  if (screen === 'home') {
+    if (gesture.isListSelect && gesture.selectedIndex !== null) {
+      await activateHomeIndex(gesture.selectedIndex)
+      return
+    }
+
+    if (gesture.isScrollDown && glassesLayout === 'text' && currentSurface.items.length > 0) {
+      selectedHomeIndex = Math.min(selectedHomeIndex + 1, currentSurface.items.length - 1)
+      await rebuildTextLayout(buildHomeText(currentSurface), currentStatusContent)
+      return
+    }
+
+    if (gesture.isScrollUp && glassesLayout === 'text' && currentSurface.items.length > 0) {
+      selectedHomeIndex = Math.max(selectedHomeIndex - 1, 0)
+      await rebuildTextLayout(buildHomeText(currentSurface), currentStatusContent)
+      return
+    }
+
+    if (gesture.isTap) {
+      await activateHomeIndex(selectedHomeIndex)
+      return
+    }
+  }
+
+  if (screen === 'confirm') {
+    if (gesture.isTap && pendingConfirmItem) {
+      const item = pendingConfirmItem
+      pendingConfirmItem = null
+      await runSurfaceAction(item)
     }
     return
   }
 
+  if (screen === 'detail') {
+    if ((gesture.isTap || gesture.isScrollDown) && currentPage < pages.length - 1) {
+      currentPage++
+      await updateBody(pages[currentPage])
+      await updateStatus(`Detail ${currentPage + 1}/${pages.length} | double: back`)
+      return
+    }
+
+    if (gesture.isScrollUp && currentPage > 0) {
+      currentPage--
+      await updateBody(pages[currentPage])
+      await updateStatus(`Detail ${currentPage + 1}/${pages.length} | double: back`)
+      return
+    }
+  }
+
   if (screen === 'chat') {
-    if (isTap) {
+    if (gesture.isTap) {
+      if ((chatState === 'idle' || chatState === 'listening') && !isInputAllowed(appConfig.inputMode, gesture.eventSource)) {
+        await updateStatus(`Input ignored | ${inputModeLabel(appConfig.inputMode)}`)
+        return
+      }
+
       switch (chatState) {
         case 'idle':
-          // Send a demo query
-          chatState = 'thinking'
-          await updateBody('HermesGlass\n\nThinking...')
-          await updateStatus('Thinking...')
-          bridgeClient.sendChat('Say hello in one short sentence.')
+          await startVoiceRecording()
+          break
+        case 'listening':
+          await stopVoiceRecordingAndSend()
           break
         case 'showing':
           if (currentPage < pages.length - 1) {
             currentPage++
             await updateBody(pages[currentPage])
-            await updateStatus(`Page ${currentPage + 1}/${pages.length} | tap: next`)
+            await updateStatus(`Page ${currentPage + 1}/${pages.length} | tap: next | double: back`)
           } else {
             chatState = 'idle'
             await updateBody('HermesGlass\n\nEnd.\nTap to ask again.')
-            await updateStatus('Idle | tap: ask')
+            await updateStatus('Idle | tap: ask | double: back')
           }
           break
         case 'error':
@@ -332,22 +1199,22 @@ async function handleEvent(event: any) {
       return
     }
 
-    if (isScrollDown && chatState === 'showing' && currentPage < pages.length - 1) {
+    if (gesture.isScrollDown && chatState === 'showing' && currentPage < pages.length - 1) {
       currentPage++
       await updateBody(pages[currentPage])
-      await updateStatus(`Page ${currentPage + 1}/${pages.length}`)
+      await updateStatus(`Page ${currentPage + 1}/${pages.length} | double: back`)
       return
     }
 
-    if (isScrollUp && chatState === 'showing' && currentPage > 0) {
+    if (gesture.isScrollUp && chatState === 'showing' && currentPage > 0) {
       currentPage--
       await updateBody(pages[currentPage])
-      await updateStatus(`Page ${currentPage + 1}/${pages.length}`)
+      await updateStatus(`Page ${currentPage + 1}/${pages.length} | double: back`)
       return
     }
   }
 
-  if (sysType === OsEventTypeList.SYSTEM_EXIT_EVENT || sysType === OsEventTypeList.ABNORMAL_EXIT_EVENT) {
+  if (gesture.isSystemExit || gesture.isAbnormalExit) {
     cleanup()
   }
 }
@@ -355,14 +1222,20 @@ async function handleEvent(event: any) {
 function cleanup() {
   if (cleanedUp) return
   cleanedUp = true
+  audioAttemptId++
+  clearRecordingTimer()
+  if (_bridge && recording) runAudioControl(_bridge, false, 2500).catch(() => {})
+  recording = false
+  unsubscribeEvents?.()
+  unsubscribeEvents = null
   bridgeClient?.disconnect()
-  // Cannot call bridge().audioControl(false) here because bridge() may hang
 }
 
 // ── Main ─────────────────────────────────────────────────────────
 
 async function main() {
   console.log('[HG] Starting...')
+  setWebState('Starting')
 
   // Create containers
   const b = await bridge()
@@ -381,26 +1254,27 @@ async function main() {
     isEventCapture: 0,
   })
 
-  const created = await b.createStartUpPageContainer(
-    new CreateStartUpPageContainer({ containerTotalNum: 2, textObject: [body, status] })
-  )
+  const page = { containerTotalNum: 2, textObject: [body, status] }
+  const created = await b.createStartUpPageContainer(new CreateStartUpPageContainer(page))
   if (created !== 0) {
-    console.error('[HG] createStartUpPageContainer failed:', created)
-    return
+    console.warn('[HG] createStartUpPageContainer failed, trying rebuild:', created)
+    const rebuilt = await b.rebuildPageContainer(new RebuildPageContainer(page))
+    if (!rebuilt) {
+      console.error('[HG] container setup failed:', created)
+      setWebState('Error')
+      setWebDisplayStatus(`Container setup failed: ${created}`)
+      return
+    }
   }
 
   // Register global event handler
-  const unsubscribe = b.onEvenHubEvent(handleEvent)
+  unsubscribeEvents = b.onEvenHubEvent(handleEvent)
   window.addEventListener('beforeunload', cleanup)
 
-  // Start in config screen to show the URL
-  const saved = await b.getLocalStorage(STORAGE_KEY)
-  if (saved && saved.length > 5) {
-    bridgeUrl = saved
-    await showChatScreen()
-  } else {
-    await showConfigScreen()
-  }
+  appConfig = await loadAppConfig(b)
+  setWebConfig(appConfig)
+  await showConfigScreen()
 }
 
-main().catch((err) => console.error('[HG] Fatal:', err))
+initWebView()
+main().catch(reportFatal)

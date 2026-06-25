@@ -9,6 +9,12 @@ ExecStart=%h/hermes-g2-bridge/venv/bin/python3 -m src.bridge_server
 Environment=BRIDGE_HOST=127.0.0.1
 Environment=BRIDGE_PORT=18790
 Environment=HERMES_URL=http://127.0.0.1:8642
+Environment=HERMES_STT_MODEL=whisper-1
+Environment=HERMES_STT_PROVIDER=local
+Environment=HERMES_LOCAL_STT_MODEL=tiny
+Environment=HERMES_LOCAL_STT_DEVICE=cpu
+Environment=HERMES_LOCAL_STT_COMPUTE_TYPE=int8
+Environment=HERMES_LOCAL_STT_LANGUAGE=it
 Environment=LOG_LEVEL=INFO
 # API_SERVER_KEY is read from ~/.hermes/.env automatically
 Restart=on-failure

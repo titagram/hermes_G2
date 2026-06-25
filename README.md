@@ -1,11 +1,11 @@
 # HermesGlass — Even Realities G2 → Hermes Agent
 
-A complete bridge that lets you talk to your Hermes AI agent through Even Realities G2 smart glasses.
+A server-driven channel that lets Even Realities G2 smart glasses interact with Hermes Agent through voice, shortcuts, dashboard data, and alerts.
 
 ```
-G2 Glasses (voice) → HermesGlass Bridge (WebSocket) → Hermes API Server → LLM
-       ↑                                                                       |
-       └──────────── text response streamed to glasses display ←──────────────┘
+G2 Glasses → HermesGlass App → HermesGlass Bridge → Hermes Agent
+     ↑               │              │                 │
+     └── UI surface ←┴── actions ←──┴── semantic data ←┘
 ```
 
 ## Architecture
@@ -14,7 +14,8 @@ G2 Glasses (voice) → HermesGlass Bridge (WebSocket) → Hermes API Server → 
 hermes-g2-bridge/
 ├── src/
 │   ├── __init__.py
-│   └── bridge_server.py      # WebSocket server (OpenClaw protocol → Hermes API)
+│   ├── bridge_server.py      # WebSocket server (OpenClaw protocol → Hermes API)
+│   └── g2_surface.py         # Semantic G2 surface/actions model
 ├── app/                      # Even Hub app (Vite + TypeScript + Even Hub SDK)
 │   ├── app.json              # Even Hub manifest
 │   ├── index.html
@@ -23,7 +24,12 @@ hermes-g2-bridge/
 │   ├── vite.config.ts
 │   ├── .env.example
 │   └── src/
-│       ├── main.ts           # Full G2 app: voice capture, streaming display, pagination
+│       ├── main.ts           # G2 app: profiles, surface UI, voice capture, pagination
+│       ├── config.ts         # App config and connection profiles
+│       ├── surface.ts        # Semantic surface normalization/render helpers
+│       ├── audio.ts          # PCM → WAV helpers
+│       ├── events.ts         # G2/ring/list event normalization
+│       ├── styles.css        # Phone-side configuration UI
 │       └── vite-env.d.ts
 ├── deploy/
 │   └── hermes-glass-bridge.service   # systemd unit
@@ -37,14 +43,17 @@ hermes-g2-bridge/
    - WebSocket server that speaks the OpenClaw gateway protocol (the protocol the G2 glasses app expects)
    - Translates every `chat.send` into a `POST /v1/chat/completions` call to the Hermes API Server
    - Streams the SSE response back as OpenClaw-format `chat.event` frames (delta → final)
+   - Exposes phase-1 G2 channel extensions: `g2.surface.get`, `g2.surface.refresh`, `g2.action.run`, `g2.bootstrap.status`
    - Runs on your machine, listens on port 18790 (the OpenClaw default)
 
 2. **Even Hub App** (`app/`)
    - A Vite + TypeScript web app that runs inside the Even companion app's WebView
-   - Uses the official `@evenrealities/even_hub_sdk` to render text on the G2 display
+   - Uses the official `@evenrealities/even_hub_sdk` to render a server-driven home surface on the G2 display
+   - Stores multiple Hermes connection profiles locally on the phone
    - Captures microphone audio via `bridge.audioControl(true)`
+   - Sends captured WAV audio to the bridge for Hermes STT, then sends the transcript to Hermes chat
    - Connects to the bridge server via WebSocket and streams responses to the glasses display
-   - Pagination, tap navigation, double-tap exit
+   - Native list home, detail pagination, action confirmation, tap navigation, double-tap back/exit
 
 ## Prerequisites
 
@@ -118,7 +127,7 @@ Scan the QR code with the Even Hub companion app.
 
 **Option B: Pack and install**
 ```bash
-npx evenhub pack
+npx evenhub pack app.json dist -o HermesGlass.ehpk
 # Upload the .ehpk file through the Even Hub dev portal
 ```
 
@@ -126,12 +135,13 @@ npx evenhub pack
 
 | Action | Effect |
 |--------|--------|
-| **Long-press right temple** | Activate microphone (start voice input) |
-| **Tap while listening** | Stop recording and send to Hermes |
-| **Tap (idle)** | Start a new voice query |
-| **Tap (showing)** | Next page of response |
-| **Scroll up** | Previous page |
-| **Double-tap** | Exit app |
+| **Scroll home list** | Move through server-provided actions/data |
+| **Press home item** | Open data detail, run action, or start voice |
+| **Press VOICE** | Start voice recording |
+| **Tap ring or temple (listening)** | Stop recording, transcribe, and send to Hermes |
+| **Press/scroll detail** | Next/previous page |
+| **Double-tap on detail/confirm/result** | Back to home |
+| **Double-tap on home/config** | Exit app |
 
 ## Configuration
 
@@ -146,11 +156,27 @@ Environment variables (or CLI flags):
 | `HERMES_URL` | `http://127.0.0.1:8642` | Hermes API Server URL |
 | `API_SERVER_KEY` | (from .env) | Hermes API authentication key |
 | `HERMES_MODEL` | `hermes-agent` | Model name |
+| `HERMES_STT_MODEL` | `whisper-1` | STT model for `/v1/audio/transcriptions` |
+| `HERMES_STT_PROVIDER` | `auto` | `auto`, `hermes`, or `local` |
+| `HERMES_LOCAL_STT_MODEL` | `tiny` | faster-whisper model used by the local STT provider |
+| `HERMES_LOCAL_STT_DEVICE` | `cpu` | faster-whisper device, for example `cpu` or `cuda` |
+| `HERMES_LOCAL_STT_COMPUTE_TYPE` | `int8` | faster-whisper compute type |
+| `HERMES_LOCAL_STT_LANGUAGE` | (auto) | Optional language code such as `it` or `en` |
 | `LOG_LEVEL` | `INFO` | Logging level |
 
 ### Even Hub App
 
-Edit `app/.env.local`:
+The app opens with a mobile Even Hub configuration screen. Set these values
+there and tap **Save & Connect**:
+
+- Bridge WebSocket URL, for example `wss://titagram.tail005130.ts.net:8448/ws`
+- Optional token
+- Multiple connection profiles for multiple Hermes instances
+- STT model, default `whisper-1`
+- Recording timeout
+- Input source: ring and temples, ring only, or temples only
+
+`app/.env.local` is optional and only sets the build-time default URL:
 
 ```
 VITE_BRIDGE_URL=wss://your-tailnet-name:8448/ws
@@ -167,6 +193,18 @@ Bridge → Glasses:  {type: "res", ok: true, payload: {type: "hello-ok", protoco
 Glasses → Bridge:  {type: "req", method: "chat.send", params: {message: "...", sessionKey: "..."}}
 Bridge → Glasses:  {type: "res", ok: true, payload: {accepted: true}}
 
+Glasses → Bridge:  {type: "req", method: "audio.transcribe", params: {audioBase64: "...", mimeType: "audio/wav"}}
+Bridge → Glasses:  {type: "res", ok: true, payload: {text: "..."}}
+
+Glasses → Bridge:  {type: "req", method: "g2.surface.get", params: {}}
+Bridge → Glasses:  {type: "res", ok: true, payload: {version: 1, status: {...}, items: [...]}}
+
+Glasses → Bridge:  {type: "req", method: "g2.action.run", params: {id: "mail"}}
+Bridge → Glasses:  {type: "res", ok: true, payload: {accepted: true, state: "running"}}
+
+Glasses → Bridge:  {type: "req", method: "g2.bootstrap.status", params: {}}
+Bridge → Glasses:  {type: "res", ok: true, payload: {plugin: "hermes-g2", installed: false, ...}}
+
 Bridge → Glasses:  {type: "event", event: "chat.event", payload: {state: "delta", message: {...}}}
 Bridge → Glasses:  {type: "event", event: "chat.event", payload: {state: "final", message: {...}}}
 Bridge → Glasses:  {type: "event", event: "agent.completion", payload: {status: "ok", result: "..."}}
@@ -180,43 +218,40 @@ Hermes → Bridge:  SSE data: {choices: [{delta: {content: "..."}}]}
                   data: [DONE]
 ```
 
+### G2 Surface Contract
+
+The server sends semantic actions/data only; the G2 app owns exact layout and pagination.
+
+```json
+{
+  "version": 1,
+  "status": { "agent": "idle", "connection": "ok" },
+  "items": [
+    { "id": "server", "type": "data", "label": "SERVER", "summary": "LOAD 0.20 RAM 12%" },
+    { "id": "mail", "type": "action", "label": "MAIL", "summary": "important unread", "action": { "confirm": false, "risk": "read_only" } },
+    { "id": "voice", "type": "voice", "label": "VOICE", "summary": "press to talk" }
+  ]
+}
+```
+
+The G2 app sends only action ids back to the bridge. Prompts remain server-side.
+
 ## Adding STT (Speech-to-Text)
 
-The app captures PCM audio from the glasses microphone (16kHz, mono, s16le).
-To enable voice-to-text, integrate an STT provider in `app/src/main.ts`:
+The app captures PCM audio from the glasses microphone (16kHz, mono, s16le),
+wraps it as WAV, and sends it over the existing OpenClaw WebSocket with
+`audio.transcribe`. The bridge can transcribe it in two ways:
 
-### Option 1: whisper.cpp WASM (local, free)
-```bash
-npm install @xenova/transformers
-```
-```typescript
-// In stopRecording():
-import { pipeline } from '@xenova/transformers'
-const transcriber = await pipeline('automatic-speech-recognition', 'openai/whisper-base')
-const audio = mergePCMChunks(pcmChunks)
-const result = await transcriber(audio, { sampling_rate: 16000 })
-bridgeClient.sendChat(result.text)
-```
+- `HERMES_STT_PROVIDER=hermes`: forward the WAV file to Hermes at
+  `POST /v1/audio/transcriptions`.
+- `HERMES_STT_PROVIDER=local`: transcribe on the bridge machine with
+  `faster-whisper`.
+- `HERMES_STT_PROVIDER=auto`: try Hermes first, then switch to local STT if
+  Hermes returns 404 for the STT endpoint.
 
-### Option 2: Cloud STT (Deepgram, AssemblyAI, etc.)
-```typescript
-// In stopRecording():
-const audioBlob = new Blob(pcmChunks, { type: 'audio/pcm' })
-const formData = new FormData()
-formData.append('audio', audioBlob)
-const res = await fetch('https://api.deepgram.com/v1/listen', {
-  method: 'POST',
-  headers: { Authorization: `Bearer ${DEEPGRAM_API_KEY}` },
-  body: formData,
-})
-const data = await res.json()
-const transcript = data.results?.channels?.[0]?.alternatives?.[0]?.transcript
-if (transcript) bridgeClient.sendChat(transcript)
-```
-
-### Option 3: Hermes built-in STT
-Hermes has built-in STT support (faster-whisper, Groq, OpenAI). You can send
-the raw audio to a custom endpoint on your bridge that forwards it to Hermes.
+For Hermes versions that expose chat but not `/v1/audio/transcriptions`, use
+`HERMES_STT_PROVIDER=local`. Start with `HERMES_LOCAL_STT_MODEL=tiny` for low
+latency; use `base` if accuracy matters more than speed.
 
 ## Troubleshooting
 
@@ -227,8 +262,14 @@ the raw audio to a custom endpoint on your bridge that forwards it to Hermes.
 
 ### Glasses can't connect
 - Verify Tailscale serve: `tailscale serve status`
-- Check the bridge URL in `.env.local` matches your Tailscale hostname
-- Test the WebSocket manually: `wscat -c wss://your-host:8448/ws`
+- Check the bridge URL in the app's mobile configuration screen
+- Test the WebSocket manually:
+  `python3 test_bridge.py wss://your-host:8448/ws --no-chat --surface --run-action server`
+
+The protocol probe should print `Capabilities: audioTranscribe=True` and
+`g2Surface=True`. If it instead reports a payload like `{"ok": true}`,
+the process behind the URL is still the old bridge and must be restarted or
+redeployed.
 
 ### No response from Hermes
 - Check API_SERVER_KEY is set in `~/.hermes/.env`
