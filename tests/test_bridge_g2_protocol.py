@@ -1,4 +1,5 @@
 import json
+import asyncio
 import unittest
 
 from src.bridge_server import BridgeConnection
@@ -89,6 +90,95 @@ class BridgeG2ProtocolTests(unittest.IsolatedAsyncioTestCase):
         response = ws.sent[-1]
         self.assertEqual(response["ok"], False)
         self.assertEqual(response["error"]["code"], 404)
+
+    async def test_target_set_is_reflected_in_surface(self):
+        ws = FakeWs()
+        conn = BridgeConnection(ws, FakeHermes(), "test")
+
+        await conn._handle_request({
+            "method": "g2.target.set",
+            "params": {"target": "10.129.22.74", "scope": "HTB authorized machine"},
+        }, "target-set")
+        await conn._handle_request({"method": "g2.surface.get", "params": {}}, "surface-target")
+
+        target_response = ws.sent[-2]
+        surface_response = ws.sent[-1]
+        self.assertEqual(target_response["payload"]["target"], "10.129.22.74")
+        htb = next(item for item in surface_response["payload"]["items"] if item["id"] == "htb")
+        self.assertIn("10.129.22.74", htb["summary"])
+
+    async def test_recon_action_returns_approval_request(self):
+        ws = FakeWs()
+        conn = BridgeConnection(ws, FakeHermes(), "test")
+
+        await conn._handle_request({
+            "method": "g2.target.set",
+            "params": {"target": "10.129.22.74", "scope": "HTB authorized machine"},
+        }, "target-set")
+        await conn._handle_request({"method": "g2.action.run", "params": {"id": "hex_recon"}}, "recon")
+
+        response = ws.sent[-1]
+        self.assertEqual(response["ok"], True)
+        self.assertEqual(response["payload"]["state"], "approval")
+        self.assertEqual(response["payload"]["approval"]["target"], "10.129.22.74")
+        self.assertIn("session-medium", [option["id"] for option in response["payload"]["approval"]["options"]])
+
+    async def test_approval_detail_and_once_response(self):
+        ws = FakeWs()
+        hermes = FakeHermes()
+        conn = BridgeConnection(ws, hermes, "test")
+
+        await conn._handle_request({
+            "method": "g2.target.set",
+            "params": {"target": "10.129.22.74", "scope": "HTB authorized machine"},
+        }, "target-set")
+        await conn._handle_request({"method": "g2.action.run", "params": {"id": "hex_recon"}}, "recon")
+        approval = ws.sent[-1]["payload"]["approval"]
+
+        await conn._handle_request({
+            "method": "g2.approval.respond",
+            "params": {"id": approval["id"], "optionId": "detail"},
+        }, "approval-detail")
+        detail_response = ws.sent[-1]
+        self.assertEqual(detail_response["payload"]["state"], "detail")
+        self.assertIn("Quick recon", detail_response["payload"]["item"]["detail"])
+
+        await conn._handle_request({
+            "method": "g2.approval.respond",
+            "params": {"id": approval["id"], "optionId": "once", "sessionKey": "g2-test"},
+        }, "approval-once")
+        once_response = ws.sent[-1]
+        self.assertEqual(once_response["payload"]["state"], "running")
+        self.assertEqual(once_response["payload"]["accepted"], True)
+        await asyncio.sleep(0)
+        self.assertTrue(any("hexstrike-kali-htb" in message for message in hermes.messages))
+        self.assertTrue(any("10.129.22.74" in message for message in hermes.messages))
+
+    async def test_session_grant_skips_second_recon_approval(self):
+        ws = FakeWs()
+        hermes = FakeHermes()
+        conn = BridgeConnection(ws, hermes, "test")
+
+        await conn._handle_request({
+            "method": "g2.target.set",
+            "params": {"target": "10.129.22.74", "scope": "HTB authorized machine"},
+        }, "target-set")
+        await conn._handle_request({"method": "g2.action.run", "params": {"id": "hex_recon"}}, "recon-1")
+        approval = ws.sent[-1]["payload"]["approval"]
+        await conn._handle_request({
+            "method": "g2.approval.respond",
+            "params": {"id": approval["id"], "optionId": "session-low", "sessionKey": "g2-test"},
+        }, "approval-session")
+        await conn._handle_request({
+            "method": "g2.action.run",
+            "params": {"id": "hex_recon", "sessionKey": "g2-test"},
+        }, "recon-2")
+
+        response = ws.sent[-1]
+        self.assertEqual(response["payload"]["state"], "running")
+        self.assertNotIn("approval", response["payload"])
+        await asyncio.sleep(0)
+        self.assertGreaterEqual(len(hermes.messages), 2)
 
 
 if __name__ == "__main__":

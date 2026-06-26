@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Any, Dict, Optional
+import urllib.error
+import urllib.request
+from typing import Any, Dict, List, Optional
+
+from .g2_approval import TargetContext
 
 
 Surface = Dict[str, Any]
@@ -59,38 +63,133 @@ def server_status_item() -> dict[str, Any]:
     }
 
 
-def build_default_surface(agent_state: str = "idle") -> Surface:
+def hexstrike_health_item() -> dict[str, Any]:
+    url = os.getenv("HEXSTRIKE_HEALTH_URL", "http://127.0.0.1:8888/health")
+    try:
+        with urllib.request.urlopen(url, timeout=0.5) as response:
+            payload = response.read(48_000)
+        import json
+        health = json.loads(payload.decode("utf-8", errors="replace"))
+        telemetry = health.get("telemetry", {}) if isinstance(health, dict) else {}
+        metrics = telemetry.get("system_metrics", {}) if isinstance(telemetry, dict) else {}
+        status = str(health.get("status", "unknown"))
+        commands = telemetry.get("commands_executed", 0)
+        memory = metrics.get("memory_percent", "?")
+        cpu = metrics.get("cpu_percent", "?")
+        essentials = "tools ok" if health.get("all_essential_tools_available") else "tools missing"
+        summary = f"{status} {commands} cmds"
+        detail = (
+            "HexStrike\n"
+            f"Status: {status}\n"
+            f"Essential: {essentials}\n"
+            f"Commands: {commands}\n"
+            f"CPU: {cpu}%\n"
+            f"Memory: {memory}%"
+        )
+    except (OSError, TimeoutError, urllib.error.URLError, ValueError):
+        summary = "offline"
+        detail = "HexStrike\nStatus: unavailable\nServer health endpoint did not respond."
+
+    return {
+        "id": "hex",
+        "type": "data",
+        "label": "HEX",
+        "summary": summary,
+        "detail": detail,
+        "priority": 28,
+    }
+
+
+def htb_status_item(target: TargetContext) -> dict[str, Any]:
+    target_value = target.target.strip()
+    scope = target.scope.strip()
+    summary = target_value if target_value else "target not set"
+    detail = (
+        "HTB target\n"
+        f"Target: {target_value or 'not set'}\n"
+        f"Scope: {scope or 'not set'}\n"
+        "Report: https://titagram.tail005130.ts.net:8899/engagements/current/"
+    )
+    return {
+        "id": "htb",
+        "type": "data",
+        "label": "HTB",
+        "summary": summary,
+        "detail": detail,
+        "priority": 26,
+    }
+
+
+def recon_action_item(target: TargetContext) -> dict[str, Any]:
+    target_value = target.target.strip()
+    return {
+        "id": "hex_recon",
+        "type": "action",
+        "label": "RECON",
+        "summary": target_value or "set target",
+        "priority": 24,
+        "action": {"kind": "approval", "confirm": True, "risk": "confirm"},
+    }
+
+
+def approval_surface_item(approval: dict[str, Any]) -> dict[str, Any]:
+    approval_id = str(approval.get("id", "")).strip()
+    title = str(approval.get("title", "approval")).strip()
+    target = str(approval.get("target", "")).strip()
+    return {
+        "id": f"approval:{approval_id}",
+        "type": "action",
+        "label": "APPROVE",
+        "summary": f"{title} {target}".strip(),
+        "detail": str(approval.get("detail", "")),
+        "priority": 1000,
+        "action": {"kind": "approval", "confirm": True, "risk": "confirm"},
+    }
+
+
+def build_default_surface(
+    agent_state: str = "idle",
+    target: Optional[TargetContext] = None,
+    pending_approvals: Optional[List[dict[str, Any]]] = None,
+) -> Surface:
     now = int(time.time() * 1000)
+    target = target or TargetContext()
+    approvals = pending_approvals or []
+    items = [
+        *(approval_surface_item(approval) for approval in approvals),
+        server_status_item(),
+        hexstrike_health_item(),
+        htb_status_item(target),
+        recon_action_item(target),
+        {
+            "id": "mail",
+            "type": "action",
+            "label": "MAIL",
+            "summary": "important unread",
+            "priority": 20,
+            "action": {"kind": "run_prompt", "confirm": False, "risk": "read_only"},
+        },
+        {
+            "id": "daily",
+            "type": "action",
+            "label": "DAILY",
+            "summary": "briefing",
+            "priority": 10,
+            "action": {"kind": "run_prompt", "confirm": False, "risk": "read_only"},
+        },
+        {
+            "id": "voice",
+            "type": "voice",
+            "label": "VOICE",
+            "summary": "press to talk",
+            "priority": 0,
+        },
+    ]
     return {
         "version": 1,
         "updatedAt": now,
         "status": {"agent": agent_state, "connection": "ok"},
-        "items": [
-            server_status_item(),
-            {
-                "id": "mail",
-                "type": "action",
-                "label": "MAIL",
-                "summary": "important unread",
-                "priority": 20,
-                "action": {"kind": "run_prompt", "confirm": False, "risk": "read_only"},
-            },
-            {
-                "id": "daily",
-                "type": "action",
-                "label": "DAILY",
-                "summary": "briefing",
-                "priority": 10,
-                "action": {"kind": "run_prompt", "confirm": False, "risk": "read_only"},
-            },
-            {
-                "id": "voice",
-                "type": "voice",
-                "label": "VOICE",
-                "summary": "press to talk",
-                "priority": 0,
-            },
-        ],
+        "items": sorted(items, key=lambda item: -int(item.get("priority", 0))),
     }
 
 

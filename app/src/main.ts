@@ -43,7 +43,16 @@ import {
   upsertProfile,
 } from './config'
 import { normalizeHubEvent } from './events'
-import { type G2Surface, type SurfaceItem, formatHomeRow, normalizeSurface, paginateDetail } from './surface'
+import {
+  type G2Approval,
+  type G2Surface,
+  type SurfaceItem,
+  formatApprovalOptionRow,
+  formatHomeRow,
+  normalizeApproval,
+  normalizeSurface,
+  paginateDetail,
+} from './surface'
 import './styles.css'
 
 // ── Constants ────────────────────────────────────────────────────
@@ -64,7 +73,7 @@ const INITIAL_CONFIG = normalizeAppConfig({
 
 // ── State ────────────────────────────────────────────────────────
 
-type Screen = 'config' | 'home' | 'detail' | 'confirm' | 'chat' | 'connecting' | 'error'
+type Screen = 'config' | 'home' | 'detail' | 'confirm' | 'approval' | 'chat' | 'connecting' | 'error'
 type ChatState = 'idle' | 'listening' | 'thinking' | 'streaming' | 'showing' | 'error'
 type GlassesLayout = 'text' | 'list'
 
@@ -74,6 +83,8 @@ let appConfig = INITIAL_CONFIG
 let bridgeClient: HermesBridgeClient
 let currentSurface: G2Surface = normalizeSurface(null)
 let selectedHomeIndex = 0
+let currentApproval: G2Approval | null = null
+let selectedApprovalOptionIndex = 0
 let pendingConfirmItem: SurfaceItem | null = null
 let responseText = ''
 let pages: string[] = []
@@ -144,6 +155,14 @@ function initWebView() {
                   <option value="ring">Ring only</option>
                   <option value="temples">Temples only</option>
                 </select>
+              </div>
+              <div>
+                <label class="field-label" for="hexTargetInput">HexStrike target</label>
+                <input id="hexTargetInput" class="config-input" autocomplete="off" spellcheck="false" placeholder="10.129.22.74" />
+              </div>
+              <div>
+                <label class="field-label" for="hexScopeInput">HexStrike scope</label>
+                <input id="hexScopeInput" class="config-input" autocomplete="off" spellcheck="false" placeholder="HTB authorized machine" />
               </div>
             </div>
 
@@ -234,6 +253,8 @@ function readWebConfig(): AppConfig {
     sttModel: document.querySelector<HTMLInputElement>('#sttModelInput')?.value,
     maxRecordingMs: seconds ? Number(seconds) * 1000 : undefined,
     inputMode: document.querySelector<HTMLSelectElement>('#inputModeSelect')?.value,
+    hexTarget: document.querySelector<HTMLInputElement>('#hexTargetInput')?.value,
+    hexScope: document.querySelector<HTMLInputElement>('#hexScopeInput')?.value,
   })
 }
 
@@ -245,6 +266,8 @@ function setWebConfig(config: AppConfig) {
   const sttModelInput = document.querySelector<HTMLInputElement>('#sttModelInput')
   const maxRecordingInput = document.querySelector<HTMLInputElement>('#maxRecordingSecondsInput')
   const inputModeSelect = document.querySelector<HTMLSelectElement>('#inputModeSelect')
+  const hexTargetInput = document.querySelector<HTMLInputElement>('#hexTargetInput')
+  const hexScopeInput = document.querySelector<HTMLInputElement>('#hexScopeInput')
   const selected = activeProfile(config)
 
   if (profileNameInput) profileNameInput.value = selected.name
@@ -253,6 +276,8 @@ function setWebConfig(config: AppConfig) {
   if (sttModelInput) sttModelInput.value = config.sttModel
   if (maxRecordingInput) maxRecordingInput.value = String(Math.round(config.maxRecordingMs / 1000))
   if (inputModeSelect) inputModeSelect.value = config.inputMode
+  if (hexTargetInput) hexTargetInput.value = config.hexTarget
+  if (hexScopeInput) hexScopeInput.value = config.hexScope
 }
 
 function renderProfileOptions(config: AppConfig) {
@@ -461,6 +486,14 @@ class HermesBridgeClient {
     return this.sendRequest('g2.action.run', { id, sessionKey: 'g2-hermes' }, 30000)
   }
 
+  async setTarget(target: string, scope: string): Promise<Record<string, unknown>> {
+    return this.sendRequest('g2.target.set', { target, scope }, 10000)
+  }
+
+  async respondApproval(id: string, optionId: string): Promise<Record<string, unknown>> {
+    return this.sendRequest('g2.approval.respond', { id, optionId, sessionKey: 'g2-hermes' }, 30000)
+  }
+
   async getBootstrapStatus(): Promise<Record<string, unknown>> {
     return this.sendRequest('g2.bootstrap.status', {}, 10000)
   }
@@ -622,11 +655,27 @@ function buildHomeText(surface: G2Surface): string {
     .join('\n')
 }
 
+function buildApprovalText(approval: G2Approval): string {
+  const lines = [
+    'APPROVAL',
+    approval.title,
+    approval.target || 'target not set',
+    `risk ${approval.risk}`,
+    '',
+    ...approval.options.map((option, index) => (
+      `${index === selectedApprovalOptionIndex ? '>' : ' '} ${formatApprovalOptionRow(option)}`
+    )),
+  ]
+  return lines.join('\n')
+}
+
 async function renderHomeSurface(surface: G2Surface) {
   screen = 'home'
   chatState = 'idle'
   currentSurface = surface
   selectedHomeIndex = Math.min(selectedHomeIndex, Math.max(surface.items.length - 1, 0))
+  currentApproval = null
+  selectedApprovalOptionIndex = 0
   pendingConfirmItem = null
   setWebState('Home')
   setWebConnectionStatus(`Connected to ${activeProfile(appConfig).name}`)
@@ -674,6 +723,18 @@ async function renderHomeSurface(surface: G2Surface) {
     console.warn('[HG] Native list render failed, using text fallback:', err)
     await rebuildTextLayout(buildHomeText(surface), status)
   }
+}
+
+async function showApproval(approval: G2Approval) {
+  screen = 'approval'
+  chatState = 'idle'
+  currentApproval = approval
+  selectedApprovalOptionIndex = Math.min(selectedApprovalOptionIndex, Math.max(approval.options.length - 1, 0))
+  setWebState('Approval')
+  await rebuildTextLayout(
+    buildApprovalText(approval),
+    'Approval | press: choose | double: back'
+  )
 }
 
 async function refreshSurfaceAndRender() {
@@ -728,6 +789,7 @@ async function showChatScreen() {
     setWebConnectionStatus(`Connected to ${profile.name}`)
     setWebConnected(true)
     try {
+      await bridgeClient.setTarget(appConfig.hexTarget, appConfig.hexScope)
       const surface = await bridgeClient.getSurface()
       await renderHomeSurface(surface)
     } catch (err) {
@@ -875,6 +937,11 @@ async function activateHomeIndex(index: number) {
     return
   }
 
+  if (item.action?.kind === 'approval') {
+    await runSurfaceAction(item)
+    return
+  }
+
   if (item.action?.confirm || item.action?.risk === 'dangerous' || item.action?.risk === 'confirm') {
     await showConfirmForItem(item)
     return
@@ -913,6 +980,10 @@ async function runSurfaceAction(item: SurfaceItem) {
     const result = await bridgeClient.runAction(item.id)
     if (result.state === 'detail' && result.item && typeof result.item === 'object') {
       await showDetailForItem(normalizeSurface({ items: [result.item] }).items[0])
+    } else if (result.state === 'approval') {
+      const approval = normalizeApproval(result.approval)
+      if (!approval) throw new Error('Invalid approval payload')
+      await showApproval(approval)
     } else if (result.state === 'voice') {
       await startVoiceRecording()
     } else if (result.accepted !== true) {
@@ -924,6 +995,44 @@ async function runSurfaceAction(item: SurfaceItem) {
     screen = 'error'
     const msg = err instanceof Error ? err.message : String(err)
     await rebuildTextLayout(`Action failed:\n${cleanForG2(msg)}`, 'Error | double: back')
+  }
+}
+
+async function chooseApprovalOption(index: number) {
+  if (!currentApproval || !bridgeClient || !connected) return
+  const option = currentApproval.options[index]
+  if (!option) return
+
+  setWebState('Approval')
+  await rebuildTextLayout(
+    `${currentApproval.title}\n\n${formatApprovalOptionRow(option)}...`,
+    'Sending approval...'
+  )
+
+  try {
+    const result = await bridgeClient.respondApproval(currentApproval.id, option.id)
+    if (result.state === 'detail' && result.item && typeof result.item === 'object') {
+      await showDetailForItem(normalizeSurface({ items: [result.item] }).items[0])
+      return
+    }
+    if (result.state === 'denied') {
+      await rebuildTextLayout('Approval denied.\n\nDouble press to go back.', 'Denied | double: back')
+      screen = 'error'
+      return
+    }
+    if (result.state === 'running' || result.accepted === true) {
+      screen = 'chat'
+      chatState = 'thinking'
+      setWebState('Running')
+      await rebuildTextLayout(`${currentApproval.title}\n\nRunning...`, 'Running approved action...')
+      return
+    }
+    await rebuildTextLayout('Approval response returned without action.', 'Approval complete')
+  } catch (err) {
+    screen = 'error'
+    chatState = 'idle'
+    const msg = err instanceof Error ? err.message : String(err)
+    await rebuildTextLayout(`Approval failed:\n${cleanForG2(msg)}`, 'Error | double: back')
   }
 }
 
@@ -1149,6 +1258,33 @@ async function handleEvent(event: any) {
       await runSurfaceAction(item)
     }
     return
+  }
+
+  if (screen === 'approval') {
+    if (!currentApproval) {
+      await returnHome()
+      return
+    }
+
+    if ((gesture.isTap || gesture.isListSelect) && currentApproval.options.length > 0) {
+      const optionIndex = gesture.isListSelect && gesture.selectedIndex !== null
+        ? gesture.selectedIndex
+        : selectedApprovalOptionIndex
+      await chooseApprovalOption(optionIndex)
+      return
+    }
+
+    if (gesture.isScrollDown && selectedApprovalOptionIndex < currentApproval.options.length - 1) {
+      selectedApprovalOptionIndex++
+      await rebuildTextLayout(buildApprovalText(currentApproval), currentStatusContent)
+      return
+    }
+
+    if (gesture.isScrollUp && selectedApprovalOptionIndex > 0) {
+      selectedApprovalOptionIndex--
+      await rebuildTextLayout(buildApprovalText(currentApproval), currentStatusContent)
+      return
+    }
   }
 
   if (screen === 'detail') {

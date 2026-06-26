@@ -2,7 +2,9 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 
 import {
+  formatApprovalOptionRow,
   formatHomeRow,
+  normalizeApproval,
   normalizeSurface,
   paginateDetail,
 } from '../dist-test/surface.js'
@@ -52,4 +54,32 @@ test('paginates detail text with a fallback summary', () => {
     priority: 0,
   })
   assert.deepEqual(fallback, ['MAIL\n\n12 unread'])
+})
+
+test('normalizes approval payload with configurable options', () => {
+  const approval = normalizeApproval({
+    id: 'appr_123',
+    title: 'Quick recon',
+    target: '10.129.22.74',
+    workflow: 'hexstrike-recon',
+    risk: 'low',
+    reason: 'Run recon',
+    detail: 'Details',
+    options: [
+      { id: 'once', label: 'ONCE', kind: 'approve_once' },
+      { id: 'session-low', label: 'SESSION LOW', kind: 'approve_session', riskCeiling: 'low', ttlMinutes: 30 },
+      { id: 'deny', label: 'DENY', kind: 'deny' },
+    ],
+  })
+
+  assert.equal(approval?.id, 'appr_123')
+  assert.equal(approval?.target, '10.129.22.74')
+  assert.equal(approval?.options.length, 3)
+  assert.equal(approval?.options[1].riskCeiling, 'low')
+  assert.equal(formatApprovalOptionRow(approval.options[1]), 'SESSION LOW 30m low')
+})
+
+test('rejects invalid approval payloads', () => {
+  assert.equal(normalizeApproval(null), null)
+  assert.equal(normalizeApproval({ id: '', options: [] }), null)
 })

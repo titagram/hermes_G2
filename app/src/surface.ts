@@ -25,6 +25,27 @@ export type G2Surface = {
   items: SurfaceItem[]
 }
 
+export type ApprovalOptionKind = 'approve_once' | 'approve_session' | 'deny' | 'detail'
+
+export type ApprovalOption = {
+  id: string
+  label: string
+  kind: ApprovalOptionKind
+  riskCeiling?: string
+  ttlMinutes?: number
+}
+
+export type G2Approval = {
+  id: string
+  title: string
+  target: string
+  workflow: string
+  risk: string
+  reason: string
+  detail: string
+  options: ApprovalOption[]
+}
+
 const DEFAULT_SURFACE: G2Surface = {
   version: 1,
   updatedAt: 0,
@@ -52,6 +73,11 @@ function asItemType(value: unknown): SurfaceItemType {
 function asRisk(value: unknown): SurfaceRisk {
   if (value === 'dangerous' || value === 'confirm') return value
   return 'read_only'
+}
+
+function asApprovalKind(value: unknown): ApprovalOptionKind {
+  if (value === 'approve_session' || value === 'deny' || value === 'detail') return value
+  return 'approve_once'
 }
 
 function normalizeLabel(value: unknown, fallback: string): string {
@@ -118,4 +144,47 @@ export function paginateDetail(item: SurfaceItem, charsPerPage = 220): string[] 
     pages.push(content.slice(i, i + charsPerPage))
   }
   return pages.length ? pages : ['(no details)']
+}
+
+function normalizeApprovalOption(value: unknown): ApprovalOption | null {
+  const source = asRecord(value)
+  if (!source) return null
+  const id = asString(source.id)
+  if (!id) return null
+  const ttl = asNumber(source.ttlMinutes, 0)
+  return {
+    id,
+    label: normalizeLabel(source.label, id),
+    kind: asApprovalKind(source.kind),
+    riskCeiling: asString(source.riskCeiling) || undefined,
+    ttlMinutes: ttl > 0 ? Math.round(ttl) : undefined,
+  }
+}
+
+export function normalizeApproval(value: unknown): G2Approval | null {
+  const source = asRecord(value)
+  if (!source) return null
+  const id = asString(source.id)
+  if (!id) return null
+  const options = Array.isArray(source.options)
+    ? source.options.map(normalizeApprovalOption).filter((option): option is ApprovalOption => option !== null)
+    : []
+  if (options.length === 0) return null
+  return {
+    id,
+    title: asString(source.title, 'Approval'),
+    target: asString(source.target),
+    workflow: asString(source.workflow),
+    risk: asString(source.risk, 'unknown'),
+    reason: asString(source.reason),
+    detail: asString(source.detail),
+    options,
+  }
+}
+
+export function formatApprovalOptionRow(option: ApprovalOption, maxLength = 64): string {
+  const parts = [option.label]
+  if (option.ttlMinutes) parts.push(`${option.ttlMinutes}m`)
+  if (option.riskCeiling) parts.push(option.riskCeiling)
+  return parts.join(' ').replace(/\s+/g, ' ').trim().slice(0, maxLength)
 }

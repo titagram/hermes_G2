@@ -1,5 +1,6 @@
 import unittest
 
+from src.g2_approval import ApprovalManager, TargetContext
 from src.g2_surface import build_default_surface, find_surface_item, prompt_for_action, server_status_item
 
 
@@ -36,6 +37,42 @@ class G2SurfaceTests(unittest.TestCase):
         self.assertIsInstance(item["summary"], str)
         self.assertIsInstance(item["detail"], str)
         self.assertGreater(len(item["summary"]), 0)
+
+    def test_hexstrike_surface_items_include_current_target_and_recon(self):
+        surface = build_default_surface(target=TargetContext(
+            target="10.129.22.74",
+            scope="HTB authorized machine",
+        ))
+
+        hex_item = find_surface_item(surface, "hex")
+        htb_item = find_surface_item(surface, "htb")
+        recon_item = find_surface_item(surface, "hex_recon")
+
+        self.assertIsNotNone(hex_item)
+        self.assertEqual(hex_item["type"], "data")
+        self.assertIsNotNone(htb_item)
+        self.assertIn("10.129.22.74", htb_item["summary"])
+        self.assertIsNotNone(recon_item)
+        self.assertEqual(recon_item["type"], "action")
+        self.assertEqual(recon_item["action"]["kind"], "approval")
+        self.assertEqual(recon_item["action"]["risk"], "confirm")
+
+    def test_pending_approval_is_highest_priority_surface_item(self):
+        approvals = ApprovalManager()
+        approval = approvals.create_recon_approval(
+            TargetContext(target="10.129.22.74", scope="HTB authorized machine"),
+            prompt="run recon",
+        )
+
+        surface = build_default_surface(
+            target=TargetContext(target="10.129.22.74", scope="HTB authorized machine"),
+            pending_approvals=[approval],
+        )
+
+        first = surface["items"][0]
+        self.assertEqual(first["id"], f"approval:{approval['id']}")
+        self.assertEqual(first["label"], "APPROVE")
+        self.assertEqual(first["action"]["kind"], "approval")
 
 
 if __name__ == "__main__":

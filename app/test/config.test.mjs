@@ -19,12 +19,16 @@ test('normalizes complete mobile configuration values', () => {
     sttModel: ' faster-whisper ',
     maxRecordingMs: 90000,
     inputMode: 'ring',
+    hexTarget: ' 10.129.22.74 ',
+    hexScope: ' HTB authorized machine ',
   })
 
   assert.equal(config.bridgeUrl, 'ws://example.test:8448/ws')
   assert.equal(config.sttModel, 'faster-whisper')
   assert.equal(config.maxRecordingMs, 60000)
   assert.equal(config.inputMode, 'ring')
+  assert.equal(config.hexTarget, '10.129.22.74')
+  assert.equal(config.hexScope, 'HTB authorized machine')
 })
 
 test('falls back to defaults for invalid configuration', () => {
@@ -53,6 +57,21 @@ test('round-trips stored configuration JSON', () => {
   assert.equal(parsed.maxRecordingMs, 12000)
   assert.equal(parsed.inputMode, 'temples')
   assert.equal(activeProfile(parsed).url, 'wss://bridge.example/ws')
+})
+
+test('round-trips HexStrike target and scope', () => {
+  const serialized = serializeAppConfig({
+    bridgeUrl: 'wss://bridge.example/ws',
+    sttModel: 'whisper-1',
+    maxRecordingMs: 12000,
+    inputMode: 'all',
+    hexTarget: '10.129.22.74',
+    hexScope: 'HTB authorized machine',
+  })
+
+  const parsed = parseStoredConfig(serialized)
+  assert.equal(parsed.hexTarget, '10.129.22.74')
+  assert.equal(parsed.hexScope, 'HTB authorized machine')
 })
 
 test('filters configured input source modes', () => {

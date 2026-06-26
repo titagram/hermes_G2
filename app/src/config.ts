@@ -13,6 +13,8 @@ export type AppConfig = {
   sttModel: string
   maxRecordingMs: number
   inputMode: InputMode
+  hexTarget: string
+  hexScope: string
   activeProfileId: string
   profiles: ConnectionProfile[]
 }
@@ -27,6 +29,8 @@ export const DEFAULT_CONFIG: AppConfig = {
   sttModel: 'whisper-1',
   maxRecordingMs: 15000,
   inputMode: 'all',
+  hexTarget: '',
+  hexScope: '',
   activeProfileId: DEFAULT_PROFILE_ID,
   profiles: [{
     id: DEFAULT_PROFILE_ID,
@@ -58,6 +62,11 @@ function normalizeSttModel(value: unknown, fallback: string): string {
   if (typeof value !== 'string') return fallback
   const trimmed = value.trim()
   return trimmed ? trimmed : fallback
+}
+
+function normalizeShortText(value: unknown, maxLength: number): string {
+  if (typeof value !== 'string') return ''
+  return value.trim().replace(/\s+/g, ' ').slice(0, maxLength)
 }
 
 function normalizeRecordingMs(value: unknown, fallback: number): number {
@@ -137,6 +146,8 @@ export function normalizeAppConfig(value: Partial<AppConfig> | Record<string, un
     sttModel: normalizeSttModel(source.sttModel, DEFAULT_CONFIG.sttModel),
     maxRecordingMs: normalizeRecordingMs(source.maxRecordingMs, DEFAULT_CONFIG.maxRecordingMs),
     inputMode: isInputMode(source.inputMode) ? source.inputMode : DEFAULT_CONFIG.inputMode,
+    hexTarget: normalizeShortText(source.hexTarget, 128),
+    hexScope: normalizeShortText(source.hexScope, 240),
     activeProfileId: selectedProfile?.id ?? DEFAULT_PROFILE_ID,
     profiles,
   }

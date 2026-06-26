@@ -15,6 +15,7 @@ hermes-g2-bridge/
 ├── src/
 │   ├── __init__.py
 │   ├── bridge_server.py      # WebSocket server (OpenClaw protocol → Hermes API)
+│   ├── g2_approval.py        # G2 approval queue and bounded session grants
 │   └── g2_surface.py         # Semantic G2 surface/actions model
 ├── app/                      # Even Hub app (Vite + TypeScript + Even Hub SDK)
 │   ├── app.json              # Even Hub manifest
@@ -43,7 +44,7 @@ hermes-g2-bridge/
    - WebSocket server that speaks the OpenClaw gateway protocol (the protocol the G2 glasses app expects)
    - Translates every `chat.send` into a `POST /v1/chat/completions` call to the Hermes API Server
    - Streams the SSE response back as OpenClaw-format `chat.event` frames (delta → final)
-   - Exposes phase-1 G2 channel extensions: `g2.surface.get`, `g2.surface.refresh`, `g2.action.run`, `g2.bootstrap.status`
+   - Exposes G2 channel extensions: `g2.surface.get`, `g2.surface.refresh`, `g2.action.run`, `g2.target.*`, `g2.approval.*`, `g2.bootstrap.status`
    - Runs on your machine, listens on port 18790 (the OpenClaw default)
 
 2. **Even Hub App** (`app/`)
@@ -172,6 +173,7 @@ there and tap **Save & Connect**:
 - Bridge WebSocket URL, for example `wss://titagram.tail005130.ts.net:8448/ws`
 - Optional token
 - Multiple connection profiles for multiple Hermes instances
+- HexStrike target and scope for approved HTB/security workflows
 - STT model, default `whisper-1`
 - Recording timeout
 - Input source: ring and temples, ring only, or temples only
@@ -200,6 +202,12 @@ Glasses → Bridge:  {type: "req", method: "g2.surface.get", params: {}}
 Bridge → Glasses:  {type: "res", ok: true, payload: {version: 1, status: {...}, items: [...]}}
 
 Glasses → Bridge:  {type: "req", method: "g2.action.run", params: {id: "mail"}}
+Bridge → Glasses:  {type: "res", ok: true, payload: {accepted: true, state: "running"}}
+
+Glasses → Bridge:  {type: "req", method: "g2.target.set", params: {target: "10.129.22.74", scope: "HTB authorized machine"}}
+Bridge → Glasses:  {type: "res", ok: true, payload: {target: "10.129.22.74", scope: "HTB authorized machine"}}
+
+Glasses → Bridge:  {type: "req", method: "g2.approval.respond", params: {id: "appr_123", optionId: "session-low"}}
 Bridge → Glasses:  {type: "res", ok: true, payload: {accepted: true, state: "running"}}
 
 Glasses → Bridge:  {type: "req", method: "g2.bootstrap.status", params: {}}
@@ -235,6 +243,30 @@ The server sends semantic actions/data only; the G2 app owns exact layout and pa
 ```
 
 The G2 app sends only action ids back to the bridge. Prompts remain server-side.
+
+### HexStrike Approval Workflow
+
+If Hermes has the `hexstrike-kali-htb` skill and the `hexstrike` MCP server
+configured, the bridge can expose a controlled `RECON` action. The mobile
+Even Hub configuration screen supplies the current target and scope. The
+glasses never need to type the target directly.
+
+When `RECON` is selected, the bridge creates a structured approval request
+instead of immediately launching the workflow. The G2 display shows configurable
+options supplied by the bridge:
+
+- `ONCE`: approve only this operation.
+- `SESSION LOW`: approve similar low-risk operations for the same target and
+  workflow for a short TTL.
+- `SESSION MED`: approve similar medium-risk operations for the same target and
+  workflow for a shorter TTL.
+- `DENY`: deny the operation.
+- `DETAIL`: inspect the reason, target, scope and risk without resolving the
+  approval.
+
+Session approvals are bounded by target, workflow, risk ceiling and TTL. If
+Hermes/HexStrike needs a higher-risk operation, a different workflow, or a
+different target, the bridge must ask again.
 
 ## Adding STT (Speech-to-Text)
 

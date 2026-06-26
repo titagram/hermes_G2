@@ -40,6 +40,7 @@ try:
 except ImportError:
     raise SystemExit("aiohttp is required: pip install aiohttp")
 
+from .g2_approval import ApprovalManager, TargetContext
 from .g2_surface import build_default_surface, find_surface_item, prompt_for_action
 
 logger = logging.getLogger("hermes-glass")
@@ -288,6 +289,8 @@ class BridgeConnection:
         self.session_id: Optional[str] = None
         self.agent_id = "hermes-main"
         self.subscribed: Set[str] = set()
+        self.target = TargetContext()
+        self.approvals = ApprovalManager()
 
     async def handle(self):
         """Main read loop for aiohttp WebSocketResponse."""
@@ -347,16 +350,34 @@ class BridgeConnection:
                 "bootstrap": True,
                 "configVersion": 2,
                 "defaultSttModel": self.hermes.stt_model,
+                "g2Approvals": True,
                 "g2Surface": True,
+                "g2Targets": True,
                 "sttProvider": self.hermes.stt_provider,
                 "localSttModel": self.hermes.local_stt_model,
                 "protocol": PROTOCOL_VERSION,
-                "surfaceVersion": 1,
+                "surfaceVersion": 2,
             }))
             return
 
         if method in {"g2.surface.get", "g2.surface.refresh"}:
-            await self.ws.send_str(make_response(msg_id, build_default_surface()))
+            await self.ws.send_str(make_response(msg_id, self._build_surface()))
+            return
+
+        if method == "g2.target.get":
+            await self.ws.send_str(make_response(msg_id, self._target_payload()))
+            return
+
+        if method == "g2.target.set":
+            await self._handle_g2_target_set(msg_id, params)
+            return
+
+        if method == "g2.approval.list":
+            await self.ws.send_str(make_response(msg_id, {"approvals": self.approvals.pending()}))
+            return
+
+        if method == "g2.approval.respond":
+            await self._handle_g2_approval_respond(msg_id, params)
             return
 
         if method == "g2.bootstrap.status":
@@ -412,8 +433,18 @@ class BridgeConnection:
             await self.ws.send_str(make_error(msg_id, 400, "action id is required"))
             return
 
-        surface = build_default_surface(agent_state="busy")
-        item = find_surface_item(surface, action_id.strip())
+        action_id = action_id.strip()
+        if action_id.startswith("approval:"):
+            approval_id = action_id.split(":", 1)[1]
+            approval = self.approvals.get(approval_id)
+            if approval is None:
+                await self.ws.send_str(make_error(msg_id, 404, f"unknown approval: {approval_id}"))
+                return
+            await self.ws.send_str(make_response(msg_id, {"state": "approval", "approval": approval}))
+            return
+
+        surface = self._build_surface(agent_state="busy")
+        item = find_surface_item(surface, action_id)
         if item is None:
             await self.ws.send_str(make_error(msg_id, 404, f"unknown action: {action_id}"))
             return
@@ -431,7 +462,11 @@ class BridgeConnection:
             await self.ws.send_str(make_error(msg_id, 400, f"unsupported item type: {item_type}"))
             return
 
-        prompt = prompt_for_action(action_id.strip())
+        if action_id == "hex_recon":
+            await self._handle_hex_recon_action(msg_id, params)
+            return
+
+        prompt = prompt_for_action(action_id)
         if not prompt:
             await self.ws.send_str(make_error(msg_id, 404, f"no prompt configured for action: {action_id}"))
             return
@@ -443,10 +478,97 @@ class BridgeConnection:
         await self.ws.send_str(make_response(msg_id, {
             "accepted": True,
             "state": "running",
-            "id": action_id.strip(),
+            "id": action_id,
             "sessionKey": session_key,
         }))
         asyncio.create_task(self._handle_chat(session_key, prompt))
+
+    def _build_surface(self, agent_state: str = "idle") -> dict:
+        return build_default_surface(
+            agent_state=agent_state,
+            target=self.target,
+            pending_approvals=self.approvals.pending(),
+        )
+
+    def _target_payload(self) -> dict:
+        return {
+            "target": self.target.target,
+            "scope": self.target.scope,
+        }
+
+    async def _handle_g2_target_set(self, msg_id: str, params: dict):
+        raw_target = params.get("target", "")
+        raw_scope = params.get("scope", "")
+        target = raw_target.strip() if isinstance(raw_target, str) else ""
+        scope = raw_scope.strip() if isinstance(raw_scope, str) else ""
+        if len(target) > 128 or len(scope) > 240:
+            await self.ws.send_str(make_error(msg_id, 400, "target or scope is too long"))
+            return
+        self.target = TargetContext(target=target, scope=scope)
+        await self.ws.send_str(make_response(msg_id, self._target_payload()))
+
+    async def _handle_hex_recon_action(self, msg_id: str, params: dict):
+        target = self.target.target.strip()
+        if not target:
+            await self.ws.send_str(make_error(msg_id, 400, "HexStrike target is required"))
+            return
+
+        session_key = params.get("sessionKey", self.agent_id)
+        if not isinstance(session_key, str) or not session_key.strip():
+            session_key = self.agent_id
+
+        prompt = self._hex_recon_prompt()
+        if self.approvals.is_granted(target, "hexstrike-recon", "low"):
+            await self.ws.send_str(make_response(msg_id, {
+                "accepted": True,
+                "state": "running",
+                "id": "hex_recon",
+                "sessionKey": session_key,
+                "grant": "session",
+            }))
+            asyncio.create_task(self._handle_chat(session_key, prompt))
+            return
+
+        approval = self.approvals.create_recon_approval(self.target, prompt=prompt)
+        await self.ws.send_str(make_response(msg_id, {"state": "approval", "approval": approval}))
+
+    def _hex_recon_prompt(self) -> str:
+        scope = self.target.scope.strip() or "authorized security testing scope"
+        target = self.target.target.strip()
+        return (
+            "Use the hexstrike-kali-htb skill. "
+            f"Target {target} is authorized under scope: {scope}. "
+            "Recover current engagement state, then perform or propose only non-destructive "
+            "reconnaissance appropriate to the selected G2 approval grant. "
+            "Use HexStrike/Hermes MCP when helpful, keep the final answer concise for G2, "
+            "and update the rolling professional report when material observations are found."
+        )
+
+    async def _handle_g2_approval_respond(self, msg_id: str, params: dict):
+        approval_id = params.get("id", "")
+        option_id = params.get("optionId", "")
+        if not isinstance(approval_id, str) or not approval_id.strip():
+            await self.ws.send_str(make_error(msg_id, 400, "approval id is required"))
+            return
+        if not isinstance(option_id, str) or not option_id.strip():
+            await self.ws.send_str(make_error(msg_id, 400, "approval optionId is required"))
+            return
+
+        result = self.approvals.respond(approval_id.strip(), option_id.strip())
+        if result.get("state") == "missing":
+            await self.ws.send_str(make_error(msg_id, 404, str(result.get("error") or "approval not found")))
+            return
+
+        prompt = result.pop("prompt", None)
+        session_key = params.get("sessionKey", self.agent_id)
+        if not isinstance(session_key, str) or not session_key.strip():
+            session_key = self.agent_id
+        if result.get("state") == "running":
+            result["sessionKey"] = session_key
+
+        await self.ws.send_str(make_response(msg_id, result))
+        if isinstance(prompt, str) and prompt:
+            asyncio.create_task(self._handle_chat(session_key, prompt))
 
     async def _handle_audio_transcribe(self, msg_id: str, params: dict):
         audio_b64 = params.get("audioBase64", "")
