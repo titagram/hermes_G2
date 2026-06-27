@@ -17,6 +17,8 @@ hermes-g2-bridge/
 │   ├── bridge_server.py      # WebSocket server (OpenClaw protocol → Hermes API)
 │   ├── g2_approval.py        # G2 approval queue and bounded session grants
 │   ├── g2_hexstrike.py       # Bounded direct HexStrike worker for G2 recon
+│   ├── g2_jobs.py            # Durable in-process G2 job manager
+│   ├── g2_state.py           # SQLite-backed G2 sessions/events/jobs store
 │   └── g2_surface.py         # Semantic G2 surface/actions model
 ├── app/                      # Even Hub app (Vite + TypeScript + Even Hub SDK)
 │   ├── app.json              # Even Hub manifest
@@ -46,12 +48,15 @@ hermes-g2-bridge/
    - Translates every `chat.send` into a `POST /v1/chat/completions` call to the Hermes API Server
    - Streams the SSE response back as OpenClaw-format `chat.event` frames (delta → final)
    - Exposes G2 channel extensions: `g2.surface.get`, `g2.surface.refresh`, `g2.action.run`, `g2.target.*`, `g2.approval.*`, `g2.bootstrap.status`
+   - Persists G2 session state in SQLite, including targets, pending approvals, grants, recent events and HexStrike job status
+   - Owns long-running G2 jobs outside the WebSocket connection, so a reconnect can resume status/report visibility
    - Runs on your machine, listens on port 18790 (the OpenClaw default)
 
 2. **Even Hub App** (`app/`)
    - A Vite + TypeScript web app that runs inside the Even companion app's WebView
    - Uses the official `@evenrealities/even_hub_sdk` to render a server-driven home surface on the G2 display
    - Stores multiple Hermes connection profiles locally on the phone
+   - Persists a stable client session id and the last seen bridge event id for reconnect/replay
    - Captures microphone audio via `bridge.audioControl(true)`
    - Sends captured WAV audio to the bridge for Hermes STT, then sends the transcript to Hermes chat
    - Connects to the bridge server via WebSocket and streams responses to the glasses display
@@ -164,6 +169,7 @@ Environment variables (or CLI flags):
 | `HERMES_LOCAL_STT_DEVICE` | `cpu` | faster-whisper device, for example `cpu` or `cuda` |
 | `HERMES_LOCAL_STT_COMPUTE_TYPE` | `int8` | faster-whisper compute type |
 | `HERMES_LOCAL_STT_LANGUAGE` | (auto) | Optional language code such as `it` or `en` |
+| `HERMES_G2_STATE_DB` | `~/.hermes-g2/state.sqlite3` | SQLite database for G2 session recovery |
 | `G2_HEXSTRIKE_PROJECT_DIR` | `/home/titagram/hexstrike-kali-hermes` | HexStrike/Kali helper project directory |
 | `G2_HEXSTRIKE_SCRIPT` | `<project>/run-lan-scan.sh` | Bounded scan wrapper used by the G2 `RECON` action |
 | `G2_HEXSTRIKE_REPORT_BASE_URL` | `https://titagram.tail005130.ts.net:8899` | Report base URL shown on G2 |
@@ -179,7 +185,8 @@ there and tap **Save & Connect**:
 
 - Bridge WebSocket URL, for example `wss://titagram.tail005130.ts.net:8448/ws`
 - Optional token
-- Multiple connection profiles for multiple Hermes instances
+- Multiple connection profiles for multiple Hermes instances. Each profile has
+  its own stable G2 session id and event replay cursor.
 - HexStrike target and scope for approved HTB/security workflows
 - STT model, default `whisper-1`
 - Recording timeout
@@ -208,6 +215,9 @@ Bridge → Glasses:  {type: "res", ok: true, payload: {text: "..."}}
 Glasses → Bridge:  {type: "req", method: "g2.surface.get", params: {}}
 Bridge → Glasses:  {type: "res", ok: true, payload: {version: 1, status: {...}, items: [...]}}
 
+Glasses → Bridge:  {type: "req", method: "g2.session.resume", params: {clientSessionId: "g2s-...", profileId: "default", lastSeenEventId: 42}}
+Bridge → Glasses:  {type: "res", ok: true, payload: {session: {...}, pendingApprovals: [...], jobs: [...], missedEvents: [...]}}
+
 Glasses → Bridge:  {type: "req", method: "g2.action.run", params: {id: "mail"}}
 Bridge → Glasses:  {type: "res", ok: true, payload: {accepted: true, state: "running"}}
 
@@ -220,9 +230,9 @@ Bridge → Glasses:  {type: "res", ok: true, payload: {accepted: true, state: "r
 Glasses → Bridge:  {type: "req", method: "g2.bootstrap.status", params: {}}
 Bridge → Glasses:  {type: "res", ok: true, payload: {plugin: "hermes-g2", installed: false, ...}}
 
-Bridge → Glasses:  {type: "event", event: "chat.event", payload: {state: "delta", message: {...}}}
-Bridge → Glasses:  {type: "event", event: "chat.event", payload: {state: "final", message: {...}}}
-Bridge → Glasses:  {type: "event", event: "agent.completion", payload: {status: "ok", result: "..."}}
+Bridge → Glasses:  {type: "event", event: "chat.event", payload: {eventId: 43, state: "delta", message: {...}}}
+Bridge → Glasses:  {type: "event", event: "chat.event", payload: {eventId: 44, state: "final", message: {...}}}
+Bridge → Glasses:  {type: "event", event: "agent.completion", payload: {eventId: 45, status: "ok", result: "..."}}
 ```
 
 The bridge translates normal chat and voice turns to Hermes API Server calls:
@@ -249,6 +259,7 @@ The server sends semantic actions/data only; the G2 app owns exact layout and pa
   "status": { "agent": "idle", "connection": "ok" },
   "items": [
     { "id": "server", "type": "data", "label": "SERVER", "summary": "LOAD 0.20 RAM 12%" },
+    { "id": "job:job_123", "type": "data", "label": "JOB", "summary": "RECON running 10.129.22.74" },
     { "id": "mail", "type": "action", "label": "MAIL", "summary": "important unread", "action": { "confirm": false, "risk": "read_only" } },
     { "id": "voice", "type": "voice", "label": "VOICE", "summary": "press to talk" }
   ]
@@ -281,6 +292,11 @@ configurable options supplied by the bridge:
 Session approvals are bounded by target, workflow, risk ceiling and TTL. If
 HexStrike needs a higher-risk operation, a different workflow, or a different
 target, the bridge must ask again.
+
+Approved HexStrike scans are tracked as durable G2 jobs. If the glasses or
+mobile WebView reconnect during a scan, `g2.session.resume` restores active
+jobs, pending approvals, active grants and missed events. The home surface then
+shows a `JOB` data row with state, target, recent log output and report URL.
 
 Targets such as `192.168.1.0 /24` or `192.168.1.0 \24` are normalized to
 `192.168.1.0/24`. Public ranges are rejected by default; for example

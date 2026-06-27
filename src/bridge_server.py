@@ -42,6 +42,8 @@ except ImportError:
 
 from .g2_approval import ApprovalManager, TargetContext
 from .g2_hexstrike import HexStrikeRunner, HexStrikeTargetError, normalize_target
+from .g2_jobs import G2JobManager
+from .g2_state import G2StateStore
 from .g2_surface import build_default_surface, find_surface_item, prompt_for_action
 
 logger = logging.getLogger("hermes-glass")
@@ -283,16 +285,27 @@ class HermesClient:
 class BridgeConnection:
     """One client WebSocket connection."""
 
-    def __init__(self, ws, hermes: HermesClient, conn_id: str):
+    def __init__(
+        self,
+        ws,
+        hermes: HermesClient,
+        conn_id: str,
+        state_store: Optional[G2StateStore] = None,
+        job_manager: Optional[G2JobManager] = None,
+    ):
         self.ws = ws
         self.hermes = hermes
         self.conn_id = conn_id
         self.session_id: Optional[str] = None
+        self.g2_session_id: Optional[str] = None
         self.agent_id = "hermes-main"
         self.subscribed: Set[str] = set()
         self.target = TargetContext()
         self.approvals = ApprovalManager()
         self.hex_runner = HexStrikeRunner()
+        self.state_store = state_store
+        self.job_manager = job_manager
+        self._job_unsubscribe = None
 
     async def handle(self):
         """Main read loop for aiohttp WebSocketResponse."""
@@ -318,6 +331,9 @@ class BridgeConnection:
                     await self._process_line(line)
         except Exception as exc:
             logger.info("Connection %s ended: %s", self.conn_id, exc)
+        if self._job_unsubscribe is not None:
+            self._job_unsubscribe()
+            self._job_unsubscribe = None
         logger.info("Connection %s closed", self.conn_id)
 
     async def _process_line(self, line: str):
@@ -360,6 +376,10 @@ class BridgeConnection:
                 "protocol": PROTOCOL_VERSION,
                 "surfaceVersion": 2,
             }))
+            return
+
+        if method == "g2.session.resume":
+            await self._handle_g2_session_resume(msg_id, params)
             return
 
         if method in {"g2.surface.get", "g2.surface.refresh"}:
@@ -486,10 +506,14 @@ class BridgeConnection:
         asyncio.create_task(self._handle_chat(session_key, prompt))
 
     def _build_surface(self, agent_state: str = "idle") -> dict:
+        active_jobs = []
+        if self.state_store is not None and self.g2_session_id is not None:
+            active_jobs = self.state_store.jobs_for_session(self.g2_session_id)[:3]
         return build_default_surface(
             agent_state=agent_state,
             target=self.target,
             pending_approvals=self.approvals.pending(),
+            active_jobs=active_jobs,
         )
 
     def _target_payload(self) -> dict:
@@ -497,6 +521,95 @@ class BridgeConnection:
             "target": self.target.target,
             "scope": self.target.scope,
         }
+
+    async def _handle_g2_session_resume(self, msg_id: str, params: dict):
+        if self.state_store is None:
+            await self.ws.send_str(make_error(msg_id, 503, "G2 session store is not available"))
+            return
+
+        client_session_id = params.get("clientSessionId", "")
+        profile_id = params.get("profileId", "default")
+        if not isinstance(client_session_id, str) or not client_session_id.strip():
+            await self.ws.send_str(make_error(msg_id, 400, "clientSessionId is required"))
+            return
+        if not isinstance(profile_id, str) or not profile_id.strip():
+            profile_id = "default"
+
+        try:
+            last_seen_event_id = int(params.get("lastSeenEventId") or 0)
+        except (TypeError, ValueError):
+            last_seen_event_id = 0
+
+        target = params.get("target", "")
+        scope = params.get("scope", "")
+        target_value = normalize_target(target) if isinstance(target, str) and target.strip() else ""
+        scope_value = scope.strip() if isinstance(scope, str) else ""
+
+        try:
+            restored = self.state_store.resume_session(
+                client_session_id=client_session_id,
+                profile_id=profile_id,
+                target=target_value,
+                scope=scope_value,
+                last_seen_event_id=last_seen_event_id,
+            )
+        except ValueError as exc:
+            await self.ws.send_str(make_error(msg_id, 400, str(exc)))
+            return
+
+        self.g2_session_id = restored["session"]["id"]
+        self.target = TargetContext(
+            target=str(restored.get("target", {}).get("target") or ""),
+            scope=str(restored.get("target", {}).get("scope") or ""),
+        )
+        self._restore_approvals(restored)
+        self._subscribe_job_events()
+
+        await self.ws.send_str(make_response(msg_id, self._resume_payload(restored)))
+
+    def _restore_approvals(self, restored: dict) -> None:
+        self.approvals = ApprovalManager()
+        for record in restored.get("pendingApprovals", []):
+            if not isinstance(record, dict):
+                continue
+            approval = record.get("approval")
+            if isinstance(approval, dict):
+                self.approvals.restore_pending(approval, str(record.get("prompt") or ""))
+        for grant in restored.get("activeGrants", []):
+            if not isinstance(grant, dict):
+                continue
+            self.approvals.restore_grant(
+                target=str(grant.get("target") or ""),
+                workflow=str(grant.get("workflow") or ""),
+                risk_ceiling=str(grant.get("riskCeiling") or "low"),
+                expires_at_ms=int(grant.get("expiresAt") or 0),
+            )
+
+    def _resume_payload(self, restored: dict) -> dict:
+        return {
+            "session": restored["session"],
+            "target": restored["target"],
+            "pendingApprovals": [
+                record["approval"]
+                for record in restored.get("pendingApprovals", [])
+                if isinstance(record, dict) and isinstance(record.get("approval"), dict)
+            ],
+            "activeGrants": restored.get("activeGrants", []),
+            "jobs": restored.get("jobs", []),
+            "missedEvents": restored.get("missedEvents", []),
+        }
+
+    def _subscribe_job_events(self) -> None:
+        if self.job_manager is None or self.g2_session_id is None:
+            return
+        if self._job_unsubscribe is not None:
+            self._job_unsubscribe()
+            self._job_unsubscribe = None
+
+        async def send_job_event(event_name: str, payload: dict):
+            await self.ws.send_str(make_event(event_name, payload))
+
+        self._job_unsubscribe = self.job_manager.subscribe(self.g2_session_id, send_job_event)
 
     async def _handle_g2_target_set(self, msg_id: str, params: dict):
         raw_target = params.get("target", "")
@@ -507,6 +620,8 @@ class BridgeConnection:
             await self.ws.send_str(make_error(msg_id, 400, "target or scope is too long"))
             return
         self.target = TargetContext(target=target, scope=scope)
+        if self.state_store is not None and self.g2_session_id is not None:
+            self.state_store.set_target(self.g2_session_id, target, scope)
         await self.ws.send_str(make_response(msg_id, self._target_payload()))
 
     async def _handle_hex_recon_action(self, msg_id: str, params: dict):
@@ -536,10 +651,15 @@ class BridgeConnection:
                 "sessionKey": session_key,
                 "grant": "session",
             }))
-            asyncio.create_task(self._handle_hex_recon(session_key, self.target))
+            asyncio.create_task(self._start_hex_recon(session_key, self.target))
             return
 
         approval = self.approvals.create_recon_approval(self.target, prompt=prompt)
+        if self.state_store is not None and self.g2_session_id is not None:
+            self.state_store.save_approval(self.g2_session_id, approval, prompt=prompt)
+            self.state_store.append_event(self.g2_session_id, "g2.approval.requested", {
+                "approval": approval,
+            })
         await self.ws.send_str(make_response(msg_id, {"state": "approval", "approval": approval}))
 
     def _hex_recon_prompt(self) -> str:
@@ -580,12 +700,43 @@ class BridgeConnection:
             session_key = self.agent_id
         if result.get("state") == "running":
             result["sessionKey"] = session_key
+        if result.get("state") in {"running", "denied"}:
+            self._persist_approval_result(approval_id.strip(), result, approved_target, workflow)
 
         await self.ws.send_str(make_response(msg_id, result))
         if result.get("state") == "running" and workflow == "hexstrike-recon":
-            asyncio.create_task(self._handle_hex_recon(session_key, approved_target))
+            asyncio.create_task(self._start_hex_recon(session_key, approved_target))
         elif isinstance(prompt, str) and prompt:
             asyncio.create_task(self._handle_chat(session_key, prompt))
+
+    def _persist_approval_result(
+        self,
+        approval_id: str,
+        result: dict,
+        approved_target: TargetContext,
+        workflow: str,
+    ) -> None:
+        if self.state_store is None or self.g2_session_id is None:
+            return
+        state = str(result.get("state") or "")
+        self.state_store.resolve_approval(self.g2_session_id, approval_id, state)
+        grant = result.get("grant")
+        if isinstance(grant, dict) and grant.get("kind") == "approve_session":
+            ttl_minutes = int(grant.get("ttlMinutes") or 0)
+            self.state_store.save_grant(
+                self.g2_session_id,
+                target=approved_target.target,
+                workflow=workflow,
+                risk_ceiling=str(grant.get("riskCeiling") or "low"),
+                ttl_seconds=max(1, ttl_minutes) * 60,
+                source_channel="glasses",
+            )
+
+    async def _start_hex_recon(self, session_key: str, target: TargetContext) -> None:
+        if self.job_manager is not None and self.g2_session_id is not None:
+            await self.job_manager.start_recon(self.g2_session_id, target, session_key=session_key)
+            return
+        await self._handle_hex_recon(session_key, target)
 
     async def _handle_audio_transcribe(self, msg_id: str, params: dict):
         audio_b64 = params.get("audioBase64", "")
@@ -765,11 +916,19 @@ async def http_root(request: web.Request) -> web.Response:
 async def ws_handler(request: web.Request) -> web.StreamResponse:
     """Handle a WebSocket upgrade from the glasses (or test client)."""
     hermes: HermesClient = request.app["hermes_client"]
+    state_store: G2StateStore = request.app["g2_state_store"]
+    job_manager: G2JobManager = request.app["g2_job_manager"]
     ws = web.WebSocketResponse(heartbeat=30, max_msg_size=2**22)
     await ws.prepare(request)
 
     conn_id = str(uuid.uuid4())[:8]
-    conn = BridgeConnection(ws, hermes, conn_id)
+    conn = BridgeConnection(
+        ws,
+        hermes,
+        conn_id,
+        state_store=state_store,
+        job_manager=job_manager,
+    )
     await conn.handle()
     return ws
 
@@ -796,6 +955,8 @@ def create_app(
         local_stt_compute_type=local_stt_compute_type,
         local_stt_language=local_stt_language,
     )
+    app["g2_state_store"] = G2StateStore()
+    app["g2_job_manager"] = G2JobManager(app["g2_state_store"])
     app.router.add_get("/", http_root)
     app.router.add_get("/health", http_health)
     app.router.add_get("/ws", ws_handler)

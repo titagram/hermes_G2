@@ -5,6 +5,8 @@ export type ConnectionProfile = {
   name: string
   url: string
   token: string
+  clientSessionId: string
+  lastSeenEventId: number
 }
 
 export type AppConfig = {
@@ -16,6 +18,7 @@ export type AppConfig = {
   hexTarget: string
   hexScope: string
   activeProfileId: string
+  lastSeenEventId: number
   profiles: ConnectionProfile[]
 }
 
@@ -32,11 +35,14 @@ export const DEFAULT_CONFIG: AppConfig = {
   hexTarget: '',
   hexScope: '',
   activeProfileId: DEFAULT_PROFILE_ID,
+  lastSeenEventId: 0,
   profiles: [{
     id: DEFAULT_PROFILE_ID,
     name: 'Default',
     url: 'wss://titagram.tail005130.ts.net:8448/ws',
     token: '',
+    clientSessionId: 'g2s-default',
+    lastSeenEventId: 0,
   }],
 }
 
@@ -76,11 +82,25 @@ function normalizeRecordingMs(value: unknown, fallback: number): number {
   return Math.min(Math.round(numeric), MAX_RECORDING_MS)
 }
 
+function normalizeEventId(value: unknown): number {
+  const numeric = typeof value === 'string' ? Number(value) : value
+  if (typeof numeric !== 'number' || !Number.isFinite(numeric) || numeric < 0) return 0
+  return Math.round(numeric)
+}
+
 function normalizeProfileId(value: unknown, fallback = DEFAULT_PROFILE_ID): string {
   if (typeof value !== 'string') return fallback
   const trimmed = value.trim()
   if (!trimmed) return fallback
   return trimmed.replace(/[^a-zA-Z0-9._-]/g, '-').slice(0, 48) || fallback
+}
+
+function normalizeClientSessionId(value: unknown, profileId: string): string {
+  const fallback = (`g2s-${profileId}`).replace(/[^a-zA-Z0-9._:-]/g, '-').slice(0, 64) || 'g2s-default'
+  if (typeof value !== 'string') return fallback
+  const trimmed = value.trim()
+  if (!trimmed) return fallback
+  return trimmed.replace(/[^a-zA-Z0-9._:-]/g, '-').slice(0, 64) || fallback
 }
 
 function normalizeProfileName(value: unknown, fallback: string): string {
@@ -89,7 +109,7 @@ function normalizeProfileName(value: unknown, fallback: string): string {
   return trimmed ? trimmed.slice(0, 48) : fallback
 }
 
-function normalizeProfile(value: unknown, fallbackUrl: string): ConnectionProfile | null {
+function normalizeProfile(value: unknown, fallbackUrl: string, fallbackLastSeenEventId = 0): ConnectionProfile | null {
   if (!value || typeof value !== 'object') return null
   const source = value as Record<string, unknown>
   const id = normalizeProfileId(source.id, '')
@@ -101,13 +121,20 @@ function normalizeProfile(value: unknown, fallbackUrl: string): ConnectionProfil
     name: normalizeProfileName(source.name, id),
     url,
     token: normalizeToken(source.token),
+    clientSessionId: normalizeClientSessionId(source.clientSessionId, id),
+    lastSeenEventId: normalizeEventId(source.lastSeenEventId ?? fallbackLastSeenEventId),
   }
 }
 
-function normalizeProfiles(value: unknown, legacyUrl: string, legacyToken: string): ConnectionProfile[] {
+function normalizeProfiles(
+  value: unknown,
+  legacyUrl: string,
+  legacyToken: string,
+  legacyLastSeenEventId: number,
+): ConnectionProfile[] {
   const profiles = Array.isArray(value)
     ? value
-      .map((profile) => normalizeProfile(profile, legacyUrl))
+      .map((profile) => normalizeProfile(profile, legacyUrl, legacyLastSeenEventId))
       .filter((profile): profile is ConnectionProfile => profile !== null)
     : []
 
@@ -118,6 +145,8 @@ function normalizeProfiles(value: unknown, legacyUrl: string, legacyToken: strin
     name: 'Default',
     url: legacyUrl,
     token: legacyToken,
+    clientSessionId: 'g2s-default',
+    lastSeenEventId: legacyLastSeenEventId,
   }]
 }
 
@@ -136,7 +165,8 @@ export function normalizeAppConfig(value: Partial<AppConfig> | Record<string, un
   const source = value ?? {}
   const legacyUrl = normalizeBridgeUrl(source.bridgeUrl, DEFAULT_CONFIG.bridgeUrl)
   const legacyToken = normalizeToken(source.bridgeToken)
-  const profiles = normalizeProfiles(source.profiles, legacyUrl, legacyToken)
+  const legacyLastSeenEventId = normalizeEventId(source.lastSeenEventId)
+  const profiles = normalizeProfiles(source.profiles, legacyUrl, legacyToken, legacyLastSeenEventId)
   const requestedActiveId = normalizeProfileId(source.activeProfileId, profiles[0]?.id ?? DEFAULT_PROFILE_ID)
   const selectedProfile = profiles.find((profile) => profile.id === requestedActiveId) ?? profiles[0]
 
@@ -149,6 +179,7 @@ export function normalizeAppConfig(value: Partial<AppConfig> | Record<string, un
     hexTarget: normalizeShortText(source.hexTarget, 128),
     hexScope: normalizeShortText(source.hexScope, 240),
     activeProfileId: selectedProfile?.id ?? DEFAULT_PROFILE_ID,
+    lastSeenEventId: selectedProfile?.lastSeenEventId ?? legacyLastSeenEventId,
     profiles,
   }
 }

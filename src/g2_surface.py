@@ -147,16 +147,50 @@ def approval_surface_item(approval: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def job_surface_item(job: dict[str, Any]) -> dict[str, Any]:
+    job_id = str(job.get("id", "")).strip()
+    state = str(job.get("state", "unknown")).strip() or "unknown"
+    workflow = str(job.get("workflow", "job")).strip() or "job"
+    target = str(job.get("target", "")).strip()
+    report_url = str(job.get("reportUrl", "")).strip()
+    log_tail = str(job.get("logTail", "")).strip()
+    is_active = state in {"queued", "running"}
+    priority = 900 if is_active else 80 if state == "failed" else 60
+    summary = f"{workflow.replace('hexstrike-', '').upper()} {state}"
+    if target:
+        summary = f"{summary} {target}"
+    detail_lines = [
+        "HexStrike job",
+        f"State: {state}",
+        f"Target: {target or 'not set'}",
+    ]
+    if report_url:
+        detail_lines.append(f"Report: {report_url}")
+    if log_tail:
+        detail_lines.extend(["Recent:", log_tail[-900:]])
+    return {
+        "id": f"job:{job_id}",
+        "type": "data",
+        "label": "JOB",
+        "summary": summary,
+        "detail": "\n".join(detail_lines),
+        "priority": priority,
+    }
+
+
 def build_default_surface(
     agent_state: str = "idle",
     target: Optional[TargetContext] = None,
     pending_approvals: Optional[List[dict[str, Any]]] = None,
+    active_jobs: Optional[List[dict[str, Any]]] = None,
 ) -> Surface:
     now = int(time.time() * 1000)
     target = target or TargetContext()
     approvals = pending_approvals or []
+    jobs = active_jobs or []
     items = [
         *(approval_surface_item(approval) for approval in approvals),
+        *(job_surface_item(job) for job in jobs[:3]),
         server_status_item(),
         hexstrike_health_item(),
         htb_status_item(target),

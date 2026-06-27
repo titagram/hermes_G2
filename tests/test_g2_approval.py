@@ -77,6 +77,42 @@ class G2ApprovalTests(unittest.TestCase):
         self.assertFalse(manager.is_granted("10.129.22.75", "hexstrike-recon", "low"))
         self.assertFalse(manager.is_granted("10.129.22.74", "other-workflow", "low"))
 
+    def test_restore_pending_approval_can_be_approved_after_reconnect(self):
+        manager = ApprovalManager()
+        approval = {
+            "id": "appr_restore",
+            "title": "Quick recon",
+            "target": "10.129.22.74",
+            "scope": "HTB authorized machine",
+            "workflow": "hexstrike-recon",
+            "risk": "low",
+            "detail": "Quick recon\nTarget: 10.129.22.74",
+            "options": [
+                {"id": "once", "label": "ONCE", "kind": "approve_once"},
+                {"id": "deny", "label": "DENY", "kind": "deny"},
+            ],
+        }
+
+        manager.restore_pending(approval, prompt="run restored recon")
+        result = manager.respond("appr_restore", "once")
+
+        self.assertEqual(result["state"], "running")
+        self.assertEqual(result["prompt"], "run restored recon")
+        self.assertEqual(manager.pending(), [])
+
+    def test_restore_unexpired_grant_allows_matching_low_risk_workflow(self):
+        manager = ApprovalManager()
+
+        manager.restore_grant(
+            target="10.129.22.74",
+            workflow="hexstrike-recon",
+            risk_ceiling="low",
+            expires_at_ms=4_102_444_800_000,
+        )
+
+        self.assertTrue(manager.is_granted("10.129.22.74", "hexstrike-recon", "low"))
+        self.assertFalse(manager.is_granted("10.129.22.74", "hexstrike-recon", "medium"))
+
 
 if __name__ == "__main__":
     unittest.main()

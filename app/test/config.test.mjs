@@ -89,7 +89,13 @@ test('normalizes multiple connection profiles and trims token values', () => {
     activeProfileId: 'work',
     profiles: [
       { id: 'home', name: ' Home ', url: ' wss://home.example/ws ', token: ' token-home ' },
-      { id: 'work', name: 'Work', url: 'wss://work.example/ws', token: ' token-work ' },
+      {
+        id: 'work',
+        name: 'Work',
+        url: 'wss://work.example/ws',
+        token: ' token-work ',
+        clientSessionId: ' g2s-work-custom ',
+      },
       { id: '', name: 'Invalid', url: 'https://not-websocket.example', token: 'bad' },
     ],
   })
@@ -101,6 +107,8 @@ test('normalizes multiple connection profiles and trims token values', () => {
     name: 'Work',
     url: 'wss://work.example/ws',
     token: 'token-work',
+    clientSessionId: 'g2s-work-custom',
+    lastSeenEventId: 0,
   })
 })
 
@@ -111,8 +119,43 @@ test('falls back to default profile for legacy single-url configuration', () => 
 
   assert.equal(config.profiles.length, 1)
   assert.equal(activeProfile(config).id, 'default')
+  assert.equal(activeProfile(config).clientSessionId, 'g2s-default')
+  assert.equal(activeProfile(config).lastSeenEventId, 0)
   assert.equal(activeProfile(config).url, 'wss://legacy.example/ws')
   assert.equal(config.bridgeUrl, 'wss://legacy.example/ws')
+})
+
+test('normalizes client session id and last seen bridge event id', () => {
+  const config = normalizeAppConfig({
+    lastSeenEventId: '42',
+    activeProfileId: 'work',
+    profiles: [
+      {
+        id: 'work',
+        name: 'Work',
+        url: 'wss://work.example/ws',
+        token: '',
+        clientSessionId: ' client:work.1 ',
+      },
+    ],
+  })
+
+  assert.equal(activeProfile(config).clientSessionId, 'client:work.1')
+  assert.equal(config.lastSeenEventId, 42)
+})
+
+test('keeps last seen event ids per connection profile', () => {
+  const config = normalizeAppConfig({
+    activeProfileId: 'work',
+    profiles: [
+      { id: 'home', name: 'Home', url: 'wss://home.example/ws', token: '', lastSeenEventId: 7 },
+      { id: 'work', name: 'Work', url: 'wss://work.example/ws', token: '', lastSeenEventId: 42 },
+    ],
+  })
+
+  assert.equal(config.lastSeenEventId, 42)
+  assert.equal(config.profiles.find((profile) => profile.id === 'home')?.lastSeenEventId, 7)
+  assert.equal(activeProfile(config).lastSeenEventId, 42)
 })
 
 test('upserts and deletes profiles while preserving an active profile', () => {

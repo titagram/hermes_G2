@@ -97,6 +97,7 @@ let pcmChunks: Uint8Array[] = []
 let cleanedUp = false
 let renderTimer: number | null = null
 let recordingTimer: number | null = null
+let eventIdSaveTimer: number | null = null
 let audioAttemptId = 0
 let audioControlInFlight = 0
 let unsubscribeEvents: (() => void) | null = null
@@ -296,7 +297,14 @@ function readProfileForm(): ConnectionProfile {
     name: document.querySelector<HTMLInputElement>('#profileNameInput')?.value.trim() || existing.name,
     url: document.querySelector<HTMLInputElement>('#bridgeUrlInput')?.value.trim() || existing.url,
     token: document.querySelector<HTMLInputElement>('#bridgeTokenInput')?.value.trim() || '',
+    clientSessionId: existing.clientSessionId || createClientSessionId(),
+    lastSeenEventId: existing.lastSeenEventId || 0,
   }
+}
+
+function createClientSessionId(): string {
+  const rawId = window.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`
+  return `g2s-${rawId}`.replace(/[^a-zA-Z0-9._:-]/g, '-').slice(0, 64)
 }
 
 function escapeHtml(value: string): string {
@@ -324,6 +332,8 @@ async function createNewProfileFromForm() {
     name: 'New Profile',
     url: activeProfile(appConfig).url,
     token: '',
+    clientSessionId: createClientSessionId(),
+    lastSeenEventId: 0,
   }
   appConfig = upsertProfile(appConfig, profile, true)
   setWebConfig(appConfig)
@@ -390,6 +400,7 @@ class HermesBridgeClient {
   onDelta: ((text: string) => void) | null = null
   onFinal: ((text: string) => void) | null = null
   onError: ((msg: string) => void) | null = null
+  onEventId: ((eventId: number) => void) | null = null
 
   constructor(url: string, token = '') {
     this.url = url
@@ -455,14 +466,19 @@ class HermesBridgeClient {
             else pending.reject(new Error(msg.error?.message || 'Bridge request failed'))
           }
         } else if (msg.type === 'event') {
-          if (msg.event === 'chat.event') {
-            const p = msg.payload
-            if (p.state === 'delta') this.onDelta?.(p.message?.content || '')
-            else if (p.state === 'final') this.onFinal?.(p.message?.content || '')
-            else if (p.state === 'error') this.onError?.(p.errorMessage || 'Unknown error')
-          }
+          this.handleEvent(msg.event, msg.payload ?? {})
         }
       } catch (e) { console.error('[HG] Parse error:', e) }
+    }
+  }
+
+  private handleEvent(eventName: string, payload: any) {
+    const eventId = typeof payload?.eventId === 'number' ? payload.eventId : Number(payload?.eventId)
+    if (Number.isFinite(eventId) && eventId > 0) this.onEventId?.(Math.round(eventId))
+    if (eventName === 'chat.event') {
+      if (payload.state === 'delta') this.onDelta?.(payload.message?.content || '')
+      else if (payload.state === 'final') this.onFinal?.(payload.message?.content || '')
+      else if (payload.state === 'error') this.onError?.(payload.errorMessage || 'Unknown error')
     }
   }
 
@@ -480,6 +496,39 @@ class HermesBridgeClient {
 
   async refreshSurface(): Promise<G2Surface> {
     return normalizeSurface(await this.sendRequest('g2.surface.refresh', {}, 10000))
+  }
+
+  async resumeSession(
+    clientSessionId: string,
+    profileId: string,
+    lastSeenEventId: number,
+    target: string,
+    scope: string,
+  ): Promise<Record<string, unknown>> {
+    const payload = await this.sendRequest('g2.session.resume', {
+      clientSessionId,
+      profileId,
+      lastSeenEventId,
+      target,
+      scope,
+    }, 10000)
+    this.replayMissedEvents(payload)
+    return payload
+  }
+
+  private replayMissedEvents(payload: any) {
+    const events = Array.isArray(payload?.missedEvents) ? payload.missedEvents : []
+    for (const event of events) {
+      if (!event || typeof event !== 'object') continue
+      const eventName = typeof event.type === 'string' ? event.type : ''
+      if (!eventName) continue
+      const eventPayload = event.payload && typeof event.payload === 'object'
+        ? { ...event.payload }
+        : {}
+      const eventId = Number(event.eventId)
+      if (Number.isFinite(eventId) && eventId > 0) eventPayload.eventId = Math.round(eventId)
+      this.handleEvent(eventName, eventPayload)
+    }
   }
 
   async runAction(id: string): Promise<Record<string, unknown>> {
@@ -789,7 +838,19 @@ async function showChatScreen() {
     setWebConnectionStatus(`Connected to ${profile.name}`)
     setWebConnected(true)
     try {
-      await bridgeClient.setTarget(appConfig.hexTarget, appConfig.hexScope)
+      bridgeClient.onEventId = rememberBridgeEventId
+      try {
+        await bridgeClient.resumeSession(
+          profile.clientSessionId,
+          profile.id,
+          profile.lastSeenEventId || appConfig.lastSeenEventId,
+          appConfig.hexTarget,
+          appConfig.hexScope,
+        )
+      } catch (resumeErr) {
+        console.warn('[HG] G2 session resume failed, falling back to target set:', resumeErr)
+        await bridgeClient.setTarget(appConfig.hexTarget, appConfig.hexScope)
+      }
       const surface = await bridgeClient.getSurface()
       await renderHomeSurface(surface)
     } catch (err) {
@@ -858,6 +919,27 @@ async function saveAppConfig(nextConfig: AppConfig) {
   setWebConfig(appConfig)
   await b.setLocalStorage(CONFIG_STORAGE_KEY, serializeAppConfig(appConfig))
   await b.setLocalStorage(LEGACY_BRIDGE_URL_KEY, appConfig.bridgeUrl)
+}
+
+function rememberBridgeEventId(eventId: number) {
+  if (!Number.isFinite(eventId) || eventId <= appConfig.lastSeenEventId) return
+  const activeId = appConfig.activeProfileId
+  const profiles = appConfig.profiles.map((profile) => (
+    profile.id === activeId ? { ...profile, lastSeenEventId: eventId } : profile
+  ))
+  appConfig = normalizeAppConfig({ ...appConfig, profiles, lastSeenEventId: eventId })
+  if (eventIdSaveTimer !== null) return
+  eventIdSaveTimer = window.setTimeout(() => {
+    eventIdSaveTimer = null
+    persistLastSeenEventId().catch((err) => {
+      console.warn('[HG] Failed to persist last seen event id:', err)
+    })
+  }, 400)
+}
+
+async function persistLastSeenEventId() {
+  const b = await bridge()
+  await b.setLocalStorage(CONFIG_STORAGE_KEY, serializeAppConfig(appConfig))
 }
 
 async function loadAppConfig(b: any): Promise<AppConfig> {
@@ -1360,6 +1442,11 @@ function cleanup() {
   cleanedUp = true
   audioAttemptId++
   clearRecordingTimer()
+  if (eventIdSaveTimer !== null) {
+    clearTimeout(eventIdSaveTimer)
+    eventIdSaveTimer = null
+    persistLastSeenEventId().catch(() => {})
+  }
   if (_bridge && recording) runAudioControl(_bridge, false, 2500).catch(() => {})
   recording = false
   unsubscribeEvents?.()

@@ -89,6 +89,33 @@ class ApprovalManager:
     def pending(self) -> List[Dict[str, Any]]:
         return [dict(record.approval) for record in self._pending.values()]
 
+    def restore_pending(self, approval: Dict[str, Any], prompt: str) -> None:
+        approval_id = str(approval.get("id") or "").strip()
+        if not approval_id:
+            raise ValueError("approval id is required")
+        self._pending[approval_id] = _ApprovalRecord(
+            approval=dict(approval),
+            prompt=str(prompt or ""),
+            created_at=time.time(),
+        )
+
+    def restore_grant(
+        self,
+        target: str,
+        workflow: str,
+        risk_ceiling: str,
+        expires_at_ms: int,
+    ) -> None:
+        expires_at = float(expires_at_ms) / 1000
+        if expires_at <= time.time():
+            return
+        self._grants.append(_SessionGrant(
+            target=str(target or ""),
+            workflow=str(workflow or ""),
+            risk_ceiling=str(risk_ceiling or "low"),
+            expires_at=expires_at,
+        ))
+
     def get(self, approval_id: str) -> Optional[Dict[str, Any]]:
         record = self._pending.get(approval_id)
         return dict(record.approval) if record else None
