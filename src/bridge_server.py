@@ -57,6 +57,9 @@ DEFAULT_LOCAL_STT_MODEL = "tiny"
 DEFAULT_LOCAL_STT_DEVICE = "cpu"
 DEFAULT_LOCAL_STT_COMPUTE_TYPE = "int8"
 PROTOCOL_VERSION = 3
+BRIDGE_VERSION = "1.0.5"
+DEFAULT_REPORT_URL = "https://titagram.tail005130.ts.net:8899/engagements/current/"
+DEFAULT_LOCAL_STT_MODELS = ("tiny", "base", "small", "medium", "large-v3")
 DELTA_THRESHOLD = 40  # chars before a delta flush
 
 # ─── protocol helpers ────────────────────────────────────────────
@@ -74,9 +77,25 @@ def make_hello_ok(msg_id: str) -> str:
     return make_response(msg_id, {
         "type": "hello-ok",
         "protocol": PROTOCOL_VERSION,
-        "server": "hermes-glass/1.0",
+        "server": f"hermes-glass/{BRIDGE_VERSION}",
         "capabilities": {"streaming": True, "sessions": True},
     })
+
+def _extract_model_ids(data: Any) -> list[str]:
+    raw_items = data.get("data") if isinstance(data, dict) else data
+    if isinstance(data, dict) and raw_items is None:
+        raw_items = data.get("models")
+    if not isinstance(raw_items, list):
+        return []
+
+    ids: list[str] = []
+    for item in raw_items:
+        model_id = item.get("id") if isinstance(item, dict) else item
+        if isinstance(model_id, str) and model_id.strip():
+            cleaned = model_id.strip()
+            if cleaned not in ids:
+                ids.append(cleaned)
+    return ids
 
 # ─── Hermes API client ───────────────────────────────────────────
 
@@ -128,6 +147,26 @@ class HermesClient:
                 headers={"Authorization": f"Bearer {self.api_key}"},
             )
         return self._session
+
+    async def list_models(self) -> tuple[list[str], str]:
+        """Return available Hermes LLM models and the endpoint that provided them."""
+        for path in ("/models", "/v1/models"):
+            try:
+                models = await self._fetch_models(path)
+            except Exception as exc:
+                logger.warning("Hermes model discovery failed at %s: %s", path, exc)
+                continue
+            if models:
+                return models, path
+        return [], "configured"
+
+    async def _fetch_models(self, path: str) -> list[str]:
+        session = await self._get_session()
+        async with session.get(f"{self.base_url}{path}") as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"{path} returned {resp.status}")
+            data = await resp.json()
+        return _extract_model_ids(data)
 
     async def chat_stream(self, message: str, session_id: Optional[str] = None):
         """POST /v1/chat/completions with stream=True. Yields (delta, final, finish_reason)."""
@@ -378,6 +417,14 @@ class BridgeConnection:
             }))
             return
 
+        if method == "g2.info":
+            await self._handle_g2_info(msg_id)
+            return
+
+        if method == "g2.models.set":
+            await self._handle_g2_models_set(msg_id, params)
+            return
+
         if method == "g2.session.resume":
             await self._handle_g2_session_resume(msg_id, params)
             return
@@ -514,7 +561,94 @@ class BridgeConnection:
             target=self.target,
             pending_approvals=self.approvals.pending(),
             active_jobs=active_jobs,
+            model=self.hermes.model,
         )
+
+    async def _handle_g2_info(self, msg_id: str):
+        await self.ws.send_str(make_response(msg_id, await self._build_info()))
+
+    async def _build_info(self) -> dict[str, Any]:
+        llm_models, llm_source = await self.hermes.list_models()
+        current_llm = self.hermes.model
+        stt_current = self.hermes.local_stt_model if self.hermes.stt_provider == "local" else self.hermes.stt_model
+        report_url = os.getenv("HERMES_G2_REPORT_URL", DEFAULT_REPORT_URL).strip()
+        reports = {
+            "current": {
+                "label": "Current engagement report",
+                "url": report_url,
+                "source": "bridge",
+            },
+        } if report_url else {}
+
+        return {
+            "server": {
+                "name": "hermes-glass",
+                "version": BRIDGE_VERSION,
+                "protocol": PROTOCOL_VERSION,
+            },
+            "capabilities": {
+                "surface": True,
+                "approvals": True,
+                "sessionResume": True,
+                "audioTranscribe": True,
+                "models": True,
+                "tts": False,
+            },
+            "reports": reports,
+            "models": {
+                "llm": {
+                    "current": current_llm,
+                    "canSet": True,
+                    "source": llm_source,
+                    "available": self._model_options(llm_models, current_llm),
+                },
+                "stt": {
+                    "provider": self.hermes.stt_provider,
+                    "current": stt_current,
+                    "canSet": False,
+                    "source": "bridge",
+                    "available": self._model_options(list(DEFAULT_LOCAL_STT_MODELS), stt_current),
+                },
+                "tts": {
+                    "provider": None,
+                    "current": None,
+                    "canSet": False,
+                    "source": None,
+                    "available": [],
+                },
+            },
+        }
+
+    def _model_options(self, model_ids: list[str], current: str) -> list[dict[str, Any]]:
+        ids: list[str] = []
+        for model_id in model_ids:
+            if model_id and model_id not in ids:
+                ids.append(model_id)
+        if current and current not in ids:
+            ids.insert(0, current)
+        return [
+            {"id": model_id, "label": model_id, "active": model_id == current}
+            for model_id in ids
+        ]
+
+    async def _handle_g2_models_set(self, msg_id: str, params: dict):
+        family = params.get("family")
+        model_id = params.get("modelId")
+        if family != "llm":
+            await self.ws.send_str(make_error(msg_id, 400, "only llm model switching is supported"))
+            return
+        if not isinstance(model_id, str) or not model_id.strip():
+            await self.ws.send_str(make_error(msg_id, 400, "modelId is required"))
+            return
+
+        requested = model_id.strip()
+        models, _ = await self.hermes.list_models()
+        if requested not in models and requested != self.hermes.model:
+            await self.ws.send_str(make_error(msg_id, 404, f"unknown model: {requested}"))
+            return
+
+        self.hermes.model = requested
+        await self.ws.send_str(make_response(msg_id, await self._build_info()))
 
     def _target_payload(self) -> dict:
         return {

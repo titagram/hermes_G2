@@ -132,6 +132,17 @@ def recon_action_item(target: TargetContext) -> dict[str, Any]:
     }
 
 
+def model_picker_item(model: str) -> dict[str, Any]:
+    return {
+        "id": "model",
+        "type": "action",
+        "label": "MODEL",
+        "summary": model.strip(),
+        "priority": 22,
+        "action": {"kind": "model_picker", "confirm": False, "risk": "read_only"},
+    }
+
+
 def approval_surface_item(approval: dict[str, Any]) -> dict[str, Any]:
     approval_id = str(approval.get("id", "")).strip()
     title = str(approval.get("title", "approval")).strip()
@@ -183,6 +194,7 @@ def build_default_surface(
     target: Optional[TargetContext] = None,
     pending_approvals: Optional[List[dict[str, Any]]] = None,
     active_jobs: Optional[List[dict[str, Any]]] = None,
+    model: str = "",
 ) -> Surface:
     now = int(time.time() * 1000)
     target = target or TargetContext()
@@ -195,6 +207,7 @@ def build_default_surface(
         hexstrike_health_item(),
         htb_status_item(target),
         recon_action_item(target),
+        *([model_picker_item(model)] if model.strip() else []),
         {
             "id": "mail",
             "type": "action",
