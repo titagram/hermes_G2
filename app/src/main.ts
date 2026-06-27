@@ -46,9 +46,17 @@ import { normalizeHubEvent } from './events'
 import {
   APP_RELEASE_LABEL,
   type ConfigHelpField,
+  configSection,
   fieldHelp,
   fieldLabel,
 } from './mobile_ui'
+import {
+  DEFAULT_G2_INFO,
+  type G2Info,
+  type G2ModelOption,
+  formatModelRow,
+  normalizeG2Info,
+} from './g2_info'
 import {
   type G2Approval,
   type G2Surface,
@@ -79,7 +87,7 @@ const INITIAL_CONFIG = normalizeAppConfig({
 
 // ── State ────────────────────────────────────────────────────────
 
-type Screen = 'config' | 'home' | 'detail' | 'confirm' | 'approval' | 'chat' | 'connecting' | 'error'
+type Screen = 'config' | 'home' | 'detail' | 'confirm' | 'approval' | 'models' | 'chat' | 'connecting' | 'error'
 type ChatState = 'idle' | 'listening' | 'thinking' | 'streaming' | 'showing' | 'error'
 type GlassesLayout = 'text' | 'list'
 
@@ -88,9 +96,11 @@ let chatState: ChatState = 'idle'
 let appConfig = INITIAL_CONFIG
 let bridgeClient: HermesBridgeClient
 let currentSurface: G2Surface = normalizeSurface(null)
+let bridgeInfo: G2Info = DEFAULT_G2_INFO
 let selectedHomeIndex = 0
 let currentApproval: G2Approval | null = null
 let selectedApprovalOptionIndex = 0
+let selectedModelIndex = 0
 let pendingConfirmItem: SurfaceItem | null = null
 let responseText = ''
 let pages: string[] = []
@@ -116,6 +126,92 @@ const appRoot = document.querySelector<HTMLDivElement>('#app')
 
 function initWebView() {
   if (!appRoot) return
+  const profileSection = configSection('Profile', '<span id="profileSectionMeta">Default</span>', `
+    <div class="profile-row">
+      <div>
+        ${fieldLabel('profileSelect', 'Profile', 'profiles')}
+        <select id="profileSelect" class="config-input"></select>
+      </div>
+      <div>
+        ${fieldLabel('profileNameInput', 'Profile name', 'profiles')}
+        <input id="profileNameInput" class="config-input" autocomplete="off" spellcheck="false" />
+      </div>
+    </div>
+
+    ${fieldLabel('bridgeUrlInput', 'Bridge WebSocket URL', 'bridgeUrl')}
+    <input id="bridgeUrlInput" class="config-input" autocomplete="off" spellcheck="false" />
+
+    <div class="field-spaced">${fieldLabel('bridgeTokenInput', 'Token', 'token')}</div>
+    <input id="bridgeTokenInput" class="config-input" autocomplete="off" spellcheck="false" type="password" />
+  `)
+  const inputSection = configSection('Input', '<span id="inputSectionMeta">ring+temples</span>', `
+    <div class="settings-grid">
+      <div>
+        ${fieldLabel('sttModelInput', 'STT model', 'sttModel')}
+        <input id="sttModelInput" class="config-input" autocomplete="off" spellcheck="false" />
+      </div>
+      <div>
+        ${fieldLabel('maxRecordingSecondsInput', 'Recording seconds', 'recording')}
+        <input id="maxRecordingSecondsInput" class="config-input" type="number" min="3" max="60" step="1" />
+      </div>
+      <div>
+        ${fieldLabel('inputModeSelect', 'Input source', 'inputMode')}
+        <select id="inputModeSelect" class="config-input">
+          <option value="all">Ring and temples</option>
+          <option value="ring">Ring only</option>
+          <option value="temples">Temples only</option>
+        </select>
+      </div>
+    </div>
+  `)
+  const targetSection = configSection('Target', '<span id="targetSectionMeta">not set</span>', `
+    <div class="settings-grid">
+      <div>
+        ${fieldLabel('hexTargetInput', 'HexStrike target', 'target')}
+        <input id="hexTargetInput" class="config-input" autocomplete="off" spellcheck="false" placeholder="10.129.22.74" />
+      </div>
+      <div>
+        ${fieldLabel('hexScopeInput', 'HexStrike scope', 'scope')}
+        <input id="hexScopeInput" class="config-input" autocomplete="off" spellcheck="false" placeholder="HTB authorized machine" />
+      </div>
+    </div>
+    <div class="field-spaced">
+      <div class="label-row">
+        <span class="field-label">Reports</span>
+        <button class="help-button" type="button" data-help-field="reports" aria-label="Reports help">?</button>
+      </div>
+      <a id="reportLink" class="report-link" href="#" target="_blank" rel="noopener" hidden>Open Reports</a>
+    </div>
+  `)
+  const modelsSection = configSection('Models', '<span id="modelsSectionMeta">loading</span>', `
+    <div class="settings-grid">
+      <div>
+        ${fieldLabel('llmModelSelect', 'Hermes model', 'models')}
+        <select id="llmModelSelect" class="config-input">
+          <option value="">Connect to load models</option>
+        </select>
+      </div>
+      <div>
+        <p class="model-summary-label">STT</p>
+        <p id="sttModelSummary" class="model-summary">Not connected</p>
+      </div>
+      <div>
+        <p class="model-summary-label">TTS / Voice</p>
+        <p id="ttsModelSummary" class="model-summary">Not available</p>
+      </div>
+    </div>
+  `)
+  const controlsSection = configSection('Controls', '<span id="profileMeta">Default</span>', `
+    <div class="button-grid">
+      <button id="newProfileButton" class="button secondary" type="button">New Profile</button>
+      <button id="saveProfileButton" class="button secondary" type="button">Save Profile</button>
+      <button id="deleteProfileButton" class="button secondary danger" type="button">Delete Profile</button>
+      <button id="connectButton" class="button" type="button">Save & Connect</button>
+      <button id="testBridgeButton" class="button secondary" type="button">Test Bridge</button>
+      <button id="testPromptButton" class="button secondary" type="button" disabled>Send Test Prompt</button>
+    </div>
+  `)
+
   appRoot.innerHTML = `
     <main class="app-shell">
       <header class="app-header">
@@ -132,66 +228,13 @@ function initWebView() {
       <section class="app-main">
         <section class="panel">
           <div class="panel-body">
-            <div class="profile-row">
-              <div>
-                ${fieldLabel('profileSelect', 'Profile', 'profiles')}
-                <select id="profileSelect" class="config-input"></select>
-              </div>
-              <div>
-                ${fieldLabel('profileNameInput', 'Profile name', 'profiles')}
-                <input id="profileNameInput" class="config-input" autocomplete="off" spellcheck="false" />
-              </div>
-            </div>
-
-            ${fieldLabel('bridgeUrlInput', 'Bridge WebSocket URL', 'bridgeUrl')}
-            <input id="bridgeUrlInput" class="config-input" autocomplete="off" spellcheck="false" />
-
-            <div class="field-spaced">${fieldLabel('bridgeTokenInput', 'Token', 'token')}</div>
-            <input id="bridgeTokenInput" class="config-input" autocomplete="off" spellcheck="false" type="password" />
-
-            <div class="settings-grid">
-              <div>
-                ${fieldLabel('sttModelInput', 'STT model', 'sttModel')}
-                <input id="sttModelInput" class="config-input" autocomplete="off" spellcheck="false" />
-              </div>
-              <div>
-                ${fieldLabel('maxRecordingSecondsInput', 'Recording seconds', 'recording')}
-                <input id="maxRecordingSecondsInput" class="config-input" type="number" min="3" max="60" step="1" />
-              </div>
-              <div>
-                ${fieldLabel('inputModeSelect', 'Input source', 'inputMode')}
-                <select id="inputModeSelect" class="config-input">
-                  <option value="all">Ring and temples</option>
-                  <option value="ring">Ring only</option>
-                  <option value="temples">Temples only</option>
-                </select>
-              </div>
-              <div>
-                ${fieldLabel('hexTargetInput', 'HexStrike target', 'target')}
-                <input id="hexTargetInput" class="config-input" autocomplete="off" spellcheck="false" placeholder="10.129.22.74" />
-              </div>
-              <div>
-                ${fieldLabel('hexScopeInput', 'HexStrike scope', 'scope')}
-                <input id="hexScopeInput" class="config-input" autocomplete="off" spellcheck="false" placeholder="HTB authorized machine" />
-              </div>
-            </div>
+            ${profileSection}
+            ${inputSection}
+            ${targetSection}
+            ${modelsSection}
+            ${controlsSection}
 
             <div id="fieldHelpPanel" class="help-panel" hidden></div>
-
-            <details class="action-drawer" open>
-              <summary>
-                <span>Controls</span>
-                <span id="profileMeta" class="drawer-meta">Default</span>
-              </summary>
-              <div class="button-grid">
-                <button id="newProfileButton" class="button secondary" type="button">New Profile</button>
-                <button id="saveProfileButton" class="button secondary" type="button">Save Profile</button>
-                <button id="deleteProfileButton" class="button secondary danger" type="button">Delete Profile</button>
-                <button id="connectButton" class="button" type="button">Save & Connect</button>
-                <button id="testBridgeButton" class="button secondary" type="button">Test Bridge</button>
-                <button id="testPromptButton" class="button secondary" type="button" disabled>Send Test Prompt</button>
-              </div>
-            </details>
           </div>
         </section>
 
@@ -232,6 +275,8 @@ function initWebView() {
     ?.addEventListener('click', () => sendTestPrompt().catch(reportFatal))
   document.querySelector<HTMLSelectElement>('#profileSelect')
     ?.addEventListener('change', () => switchProfileFromSelect().catch(reportFatal))
+  document.querySelector<HTMLSelectElement>('#llmModelSelect')
+    ?.addEventListener('change', () => setModelFromMobile().catch(reportFatal))
   document.querySelectorAll<HTMLButtonElement>('.help-button')
     .forEach((button) => button.addEventListener('click', () => showFieldHelp(button.dataset.helpField)))
 }
@@ -311,7 +356,71 @@ function setWebConfig(config: AppConfig) {
   if (inputModeSelect) inputModeSelect.value = config.inputMode
   if (hexTargetInput) hexTargetInput.value = config.hexTarget
   if (hexScopeInput) hexScopeInput.value = config.hexScope
+  setText('#profileSectionMeta', selected.name)
+  setText('#inputSectionMeta', `${inputModeLabel(config.inputMode)} | ${Math.round(config.maxRecordingMs / 1000)}s`)
+  setText('#targetSectionMeta', config.hexTarget || 'not set')
+  setText('#modelsSectionMeta', 'connect to load')
   setText('#profileMeta', `${selected.name} | ${APP_RELEASE_LABEL}`)
+}
+
+function renderBridgeInfo(info: G2Info) {
+  bridgeInfo = info
+  renderLlmModelOptions(info.models.llm.available, info.models.llm.current)
+  const llmCurrent = info.models.llm.current || 'not loaded'
+  const sttCurrent = info.models.stt.current || appConfig.sttModel
+  const ttsCurrent = info.models.tts.current || 'not available'
+  setText('#modelsSectionMeta', llmCurrent)
+  setText('#sttModelSummary', `${info.models.stt.provider || 'provider'} | ${sttCurrent}`)
+  setText('#ttsModelSummary', ttsCurrent)
+  setReportLink(info.reports.current?.url || '')
+}
+
+function renderLlmModelOptions(options: G2ModelOption[], current: string | null) {
+  const select = document.querySelector<HTMLSelectElement>('#llmModelSelect')
+  if (!select) return
+  select.replaceChildren()
+  if (options.length === 0) {
+    const option = new Option('Connect to load models', '')
+    select.append(option)
+    select.disabled = true
+    return
+  }
+  for (const item of options) {
+    const option = new Option(formatModelRow(item), item.id)
+    option.selected = item.id === current
+    select.append(option)
+  }
+  select.disabled = !bridgeInfo.models.llm.canSet
+}
+
+function setReportLink(url: string) {
+  const link = document.querySelector<HTMLAnchorElement>('#reportLink')
+  if (!link) return
+  if (!url) {
+    link.hidden = true
+    link.removeAttribute('href')
+    return
+  }
+  link.href = url
+  link.hidden = false
+}
+
+async function setModelFromMobile() {
+  const select = document.querySelector<HTMLSelectElement>('#llmModelSelect')
+  const modelId = select?.value.trim()
+  if (!modelId || modelId === bridgeInfo.models.llm.current) return
+  if (!bridgeClient || !connected) {
+    setWebConnectionStatus('Connect before switching model.')
+    renderBridgeInfo(bridgeInfo)
+    return
+  }
+
+  setWebState('Model')
+  setWebConnectionStatus(`Switching model to ${modelId}...`)
+  const nextInfo = await bridgeClient.setModel(modelId)
+  renderBridgeInfo(nextInfo)
+  setWebConnectionStatus(`Model set to ${nextInfo.models.llm.current || modelId}`)
+  if (screen === 'home') await refreshSurfaceAndRender()
 }
 
 function renderProfileOptions(config: AppConfig) {
@@ -521,6 +630,14 @@ class HermesBridgeClient {
 
   async getBridgeCapabilities(): Promise<Record<string, unknown>> {
     return this.sendRequest('bridge.capabilities', {}, 10000)
+  }
+
+  async getInfo(): Promise<G2Info> {
+    return normalizeG2Info(await this.sendRequest('g2.info', {}, 10000))
+  }
+
+  async setModel(modelId: string): Promise<G2Info> {
+    return normalizeG2Info(await this.sendRequest('g2.models.set', { family: 'llm', modelId }, 20000))
   }
 
   async getSurface(): Promise<G2Surface> {
@@ -751,7 +868,42 @@ function buildApprovalText(approval: G2Approval): string {
   return lines.join('\n')
 }
 
+function buildModelPickerText(): string {
+  const options = bridgeInfo.models.llm.available
+  if (options.length === 0) {
+    return 'MODELS\n\nNo models reported by bridge.'
+  }
+  return [
+    'MODELS',
+    bridgeInfo.models.llm.canSet ? 'Hermes LLM' : 'Read only',
+    '',
+    ...options.map((option, index) => (
+      `${index === selectedModelIndex ? '>' : ' '} ${formatModelRow(option)}`
+    )),
+  ].join('\n')
+}
+
+function surfaceWithClientModelItem(surface: G2Surface): G2Surface {
+  const currentModel = bridgeInfo.models.llm.current
+  if (!currentModel || surface.items.some((item) => item.id === 'model')) return surface
+  return normalizeSurface({
+    ...surface,
+    items: [
+      ...surface.items,
+      {
+        id: 'model',
+        type: 'action',
+        label: 'MODEL',
+        summary: currentModel,
+        priority: 22,
+        action: { kind: 'model_picker', confirm: false, risk: 'read_only' },
+      },
+    ],
+  })
+}
+
 async function renderHomeSurface(surface: G2Surface) {
+  surface = surfaceWithClientModelItem(surface)
   screen = 'home'
   chatState = 'idle'
   currentSurface = surface
@@ -819,6 +971,32 @@ async function showApproval(approval: G2Approval) {
   )
 }
 
+async function showModelPicker() {
+  screen = 'models'
+  chatState = 'idle'
+  const options = bridgeInfo.models.llm.available
+  const activeIndex = options.findIndex((option) => option.active || option.id === bridgeInfo.models.llm.current)
+  selectedModelIndex = Math.max(0, activeIndex)
+  setWebState('Models')
+  await rebuildTextLayout(buildModelPickerText(), 'Models | press: set | double: back')
+}
+
+async function chooseModelOption(index: number) {
+  if (!bridgeClient || !connected) return
+  const option = bridgeInfo.models.llm.available[index]
+  if (!option) return
+  if (!bridgeInfo.models.llm.canSet) {
+    await rebuildTextLayout('MODELS\n\nModel switching is read-only on this bridge.', 'Models | double: back')
+    return
+  }
+
+  setWebState('Model')
+  await rebuildTextLayout(`MODEL\n\nSwitching to:\n${option.id}`, 'Switching model...')
+  const nextInfo = await bridgeClient.setModel(option.id)
+  renderBridgeInfo(nextInfo)
+  await rebuildTextLayout(`MODEL\n\nCurrent:\n${nextInfo.models.llm.current || option.id}`, 'Model set | double: back')
+}
+
 async function refreshSurfaceAndRender() {
   if (!bridgeClient || !connected) return
   const surface = await bridgeClient.getSurface()
@@ -872,6 +1050,12 @@ async function showChatScreen() {
     setWebConnected(true)
     try {
       bridgeClient.onEventId = rememberBridgeEventId
+      try {
+        renderBridgeInfo(await bridgeClient.getInfo())
+      } catch (infoErr) {
+        console.warn('[HG] g2.info unavailable, using legacy bridge metadata:', infoErr)
+        renderBridgeInfo(DEFAULT_G2_INFO)
+      }
       try {
         await bridgeClient.resumeSession(
           profile.clientSessionId,
@@ -1049,6 +1233,11 @@ async function activateHomeIndex(index: number) {
 
   if (item.type === 'data') {
     await showDetailForItem(item)
+    return
+  }
+
+  if (item.action?.kind === 'model_picker') {
+    await showModelPicker()
     return
   }
 
@@ -1398,6 +1587,29 @@ async function handleEvent(event: any) {
     if (gesture.isScrollUp && selectedApprovalOptionIndex > 0) {
       selectedApprovalOptionIndex--
       await rebuildTextLayout(buildApprovalText(currentApproval), currentStatusContent)
+      return
+    }
+  }
+
+  if (screen === 'models') {
+    const options = bridgeInfo.models.llm.available
+    if ((gesture.isTap || gesture.isListSelect) && options.length > 0) {
+      const optionIndex = gesture.isListSelect && gesture.selectedIndex !== null
+        ? gesture.selectedIndex
+        : selectedModelIndex
+      await chooseModelOption(optionIndex)
+      return
+    }
+
+    if (gesture.isScrollDown && selectedModelIndex < options.length - 1) {
+      selectedModelIndex++
+      await rebuildTextLayout(buildModelPickerText(), currentStatusContent)
+      return
+    }
+
+    if (gesture.isScrollUp && selectedModelIndex > 0) {
+      selectedModelIndex--
+      await rebuildTextLayout(buildModelPickerText(), currentStatusContent)
       return
     }
   }

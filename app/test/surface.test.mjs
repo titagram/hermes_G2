@@ -33,6 +33,24 @@ test('normalizes, sorts, and clips surface item labels for G2 rows', () => {
   assert.equal(formatHomeRow(surface.items[1]), 'DAILY BRIEFING ready')
 })
 
+test('normalizes model action surface items', () => {
+  const surface = normalizeSurface({
+    items: [
+      {
+        id: 'model',
+        type: 'action',
+        label: 'MODEL',
+        summary: 'gemma4:local',
+        priority: 22,
+        action: { kind: 'model_picker', confirm: false, risk: 'read_only' },
+      },
+    ],
+  })
+
+  assert.equal(surface.items[0].action?.kind, 'model_picker')
+  assert.equal(formatHomeRow(surface.items[0]), 'MODEL gemma4:local')
+})
+
 test('paginates detail text with a fallback summary', () => {
   const pages = paginateDetail({
     id: 'server',

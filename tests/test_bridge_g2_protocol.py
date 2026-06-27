@@ -17,9 +17,11 @@ class FakeWs:
 
 
 class FakeHermes:
+    model = "hermes-agent"
     stt_model = "whisper-1"
     stt_provider = "local"
     local_stt_model = "tiny"
+    available_models = ["hermes-agent"]
 
     def __init__(self):
         self.messages = []
@@ -27,6 +29,9 @@ class FakeHermes:
     async def chat_stream(self, message, session_id=None):
         self.messages.append(message)
         yield (None, "ok", "stop")
+
+    async def list_models(self):
+        return list(self.available_models), "/models"
 
 
 class FakeHexRunner:
@@ -79,6 +84,75 @@ class BridgeG2ProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["ok"], True)
         self.assertEqual(response["payload"]["version"], 1)
         self.assertTrue(any(item["id"] == "voice" for item in response["payload"]["items"]))
+
+    async def test_g2_info_returns_models_reports_and_capabilities(self):
+        ws = FakeWs()
+        hermes = FakeHermes()
+        hermes.available_models = ["gemma4:local", "qwen-coder"]
+        hermes.model = "gemma4:local"
+        conn = BridgeConnection(ws, hermes, "test")
+
+        await conn._handle_request({"method": "g2.info", "params": {}}, "info-1")
+
+        response = ws.sent[-1]
+        self.assertEqual(response["ok"], True)
+        payload = response["payload"]
+        self.assertEqual(payload["capabilities"]["models"], True)
+        self.assertEqual(payload["models"]["llm"]["current"], "gemma4:local")
+        self.assertEqual(
+            [item["id"] for item in payload["models"]["llm"]["available"]],
+            ["gemma4:local", "qwen-coder"],
+        )
+        self.assertEqual(payload["models"]["llm"]["available"][0]["active"], True)
+        self.assertIn("reports", payload)
+        self.assertTrue(payload["reports"]["current"]["url"].startswith("https://"))
+        self.assertEqual(payload["models"]["tts"]["available"], [])
+
+    async def test_g2_info_includes_current_model_when_models_endpoint_misses_it(self):
+        ws = FakeWs()
+        hermes = FakeHermes()
+        hermes.available_models = ["qwen-coder"]
+        hermes.model = "gemma4:local"
+        conn = BridgeConnection(ws, hermes, "test")
+
+        await conn._handle_request({"method": "g2.info", "params": {}}, "info-2")
+
+        llm = ws.sent[-1]["payload"]["models"]["llm"]
+        self.assertEqual(llm["current"], "gemma4:local")
+        self.assertIn("gemma4:local", [item["id"] for item in llm["available"]])
+        self.assertTrue(next(item for item in llm["available"] if item["id"] == "gemma4:local")["active"])
+
+    async def test_g2_models_set_updates_current_llm_model(self):
+        ws = FakeWs()
+        hermes = FakeHermes()
+        hermes.available_models = ["gemma4:local", "qwen-coder"]
+        hermes.model = "gemma4:local"
+        conn = BridgeConnection(ws, hermes, "test")
+
+        await conn._handle_request({
+            "method": "g2.models.set",
+            "params": {"family": "llm", "modelId": "qwen-coder"},
+        }, "model-set")
+
+        response = ws.sent[-1]
+        self.assertEqual(response["ok"], True)
+        self.assertEqual(hermes.model, "qwen-coder")
+        self.assertEqual(response["payload"]["models"]["llm"]["current"], "qwen-coder")
+
+    async def test_g2_models_set_rejects_unknown_model(self):
+        ws = FakeWs()
+        hermes = FakeHermes()
+        hermes.available_models = ["gemma4:local"]
+        conn = BridgeConnection(ws, hermes, "test")
+
+        await conn._handle_request({
+            "method": "g2.models.set",
+            "params": {"family": "llm", "modelId": "missing"},
+        }, "model-missing")
+
+        response = ws.sent[-1]
+        self.assertEqual(response["ok"], False)
+        self.assertEqual(response["error"]["code"], 404)
 
     async def test_action_run_rejects_unknown_action(self):
         ws = FakeWs()

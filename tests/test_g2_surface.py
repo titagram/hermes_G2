@@ -70,6 +70,15 @@ class G2SurfaceTests(unittest.TestCase):
         self.assertEqual(recon_item["action"]["kind"], "approval")
         self.assertEqual(recon_item["action"]["risk"], "confirm")
 
+    def test_default_surface_includes_model_picker_when_model_is_known(self):
+        surface = build_default_surface(model="gemma4:local")
+        model = find_surface_item(surface, "model")
+
+        self.assertIsNotNone(model)
+        self.assertEqual(model["label"], "MODEL")
+        self.assertEqual(model["summary"], "gemma4:local")
+        self.assertEqual(model["action"]["kind"], "model_picker")
+
     def test_pending_approval_is_highest_priority_surface_item(self):
         approvals = ApprovalManager()
         approval = approvals.create_recon_approval(
