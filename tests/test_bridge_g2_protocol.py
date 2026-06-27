@@ -1,8 +1,11 @@
 import json
 import asyncio
+import os
 import unittest
 
 from src.bridge_server import BridgeConnection
+from src.g2_jobs import G2JobManager
+from src.g2_state import G2StateStore
 
 
 class FakeWs:
@@ -30,6 +33,15 @@ class FakeHexRunner:
     def __init__(self):
         self.targets = []
 
+    def build_plan(self, target):
+        from src.g2_hexstrike import HexStrikeRunPlan
+        return HexStrikeRunPlan(
+            target=target,
+            name=f"g2-{target.replace('.', '-')}",
+            command=["scan", target],
+            report_url=f"https://reports.example/{target}/",
+        )
+
     def validate_target(self, target):
         return target
 
@@ -40,6 +52,23 @@ class FakeHexRunner:
 
 
 class BridgeG2ProtocolTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        old_health_url = os.environ.get("HEXSTRIKE_HEALTH_URL")
+        os.environ["HEXSTRIKE_HEALTH_URL"] = "http://127.0.0.1:1/health"
+
+        def restore_health_url():
+            if old_health_url is None:
+                os.environ.pop("HEXSTRIKE_HEALTH_URL", None)
+            else:
+                os.environ["HEXSTRIKE_HEALTH_URL"] = old_health_url
+
+        self.addCleanup(restore_health_url)
+
+    def stateful_conn(self, store, runner=None):
+        ws = FakeWs()
+        manager = G2JobManager(store, runner=runner or FakeHexRunner())
+        return ws, BridgeConnection(ws, FakeHermes(), "test", state_store=store, job_manager=manager), manager
+
     async def test_surface_get_returns_semantic_items(self):
         ws = FakeWs()
         conn = BridgeConnection(ws, FakeHermes(), "test")
@@ -212,6 +241,125 @@ class BridgeG2ProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["ok"], False)
         self.assertEqual(response["error"]["code"], 400)
         self.assertIn("outside allowed", response["error"]["message"])
+
+    async def test_session_resume_restores_target_pending_approval_and_events(self):
+        store = G2StateStore(":memory:")
+        self.addCleanup(store.close)
+        runner = FakeHexRunner()
+        ws1, conn1, _manager = self.stateful_conn(store, runner)
+
+        await conn1._handle_request({
+            "method": "g2.session.resume",
+            "params": {"clientSessionId": "client-1", "profileId": "default"},
+        }, "resume-1")
+        session = ws1.sent[-1]["payload"]["session"]
+        await conn1._handle_request({
+            "method": "g2.target.set",
+            "params": {"target": "10.129.22.74", "scope": "HTB authorized machine"},
+        }, "target-set")
+        await conn1._handle_request({"method": "g2.action.run", "params": {"id": "hex_recon"}}, "recon")
+        approval = ws1.sent[-1]["payload"]["approval"]
+        first_event = store.append_event(session["id"], "chat.event", {"state": "delta", "message": "old"})
+        store.append_event(session["id"], "chat.event", {"state": "final", "message": "new"})
+
+        ws2, conn2, _manager2 = self.stateful_conn(store, runner)
+        await conn2._handle_request({
+            "method": "g2.session.resume",
+            "params": {
+                "clientSessionId": "client-1",
+                "profileId": "default",
+                "lastSeenEventId": first_event["eventId"],
+            },
+        }, "resume-2")
+
+        payload = ws2.sent[-1]["payload"]
+        self.assertEqual(payload["session"]["id"], session["id"])
+        self.assertEqual(payload["target"]["target"], "10.129.22.74")
+        self.assertEqual(payload["pendingApprovals"][0]["id"], approval["id"])
+        self.assertEqual([event["type"] for event in payload["missedEvents"]], ["chat.event"])
+        self.assertEqual(payload["missedEvents"][0]["payload"]["message"], "new")
+
+    async def test_resume_returns_active_jobs(self):
+        store = G2StateStore(":memory:")
+        self.addCleanup(store.close)
+        session = store.resume_session("client-1", "default")["session"]
+        job = store.create_job(
+            session["id"],
+            workflow="hexstrike-recon",
+            target="10.129.22.74",
+            state="running",
+            command=["scan", "10.129.22.74"],
+            report_url="https://reports.example/10.129.22.74/",
+        )
+        ws, conn, _manager = self.stateful_conn(store)
+
+        await conn._handle_request({
+            "method": "g2.session.resume",
+            "params": {"clientSessionId": "client-1", "profileId": "default"},
+        }, "resume-jobs")
+
+        payload = ws.sent[-1]["payload"]
+        self.assertEqual(payload["jobs"][0]["id"], job["id"])
+        self.assertEqual(payload["jobs"][0]["state"], "running")
+
+    async def test_surface_after_resume_includes_active_jobs(self):
+        store = G2StateStore(":memory:")
+        self.addCleanup(store.close)
+        session = store.resume_session("client-1", "default")["session"]
+        job = store.create_job(
+            session["id"],
+            workflow="hexstrike-recon",
+            target="10.129.22.74",
+            state="running",
+            command=["scan", "10.129.22.74"],
+        )
+        ws, conn, _manager = self.stateful_conn(store)
+
+        await conn._handle_request({
+            "method": "g2.session.resume",
+            "params": {"clientSessionId": "client-1", "profileId": "default"},
+        }, "resume")
+        await conn._handle_request({"method": "g2.surface.get", "params": {}}, "surface")
+
+        items = ws.sent[-1]["payload"]["items"]
+        self.assertTrue(any(item["id"] == f"job:{job['id']}" for item in items))
+
+    async def test_restored_session_grant_skips_reconnect_approval(self):
+        store = G2StateStore(":memory:")
+        self.addCleanup(store.close)
+        runner = FakeHexRunner()
+        ws1, conn1, manager = self.stateful_conn(store, runner)
+
+        await conn1._handle_request({
+            "method": "g2.session.resume",
+            "params": {"clientSessionId": "client-1", "profileId": "default"},
+        }, "resume-1")
+        await conn1._handle_request({
+            "method": "g2.target.set",
+            "params": {"target": "10.129.22.74", "scope": "HTB authorized machine"},
+        }, "target-set")
+        await conn1._handle_request({"method": "g2.action.run", "params": {"id": "hex_recon"}}, "recon")
+        approval = ws1.sent[-1]["payload"]["approval"]
+        await conn1._handle_request({
+            "method": "g2.approval.respond",
+            "params": {"id": approval["id"], "optionId": "session-low", "sessionKey": "g2-test"},
+        }, "approval-session")
+        for job in store.jobs_for_session(ws1.sent[0]["payload"]["session"]["id"], active_only=True):
+            await manager.wait_for_job(job["id"])
+
+        ws2, conn2, _manager2 = self.stateful_conn(store, runner)
+        await conn2._handle_request({
+            "method": "g2.session.resume",
+            "params": {"clientSessionId": "client-1", "profileId": "default"},
+        }, "resume-2")
+        await conn2._handle_request({
+            "method": "g2.action.run",
+            "params": {"id": "hex_recon", "sessionKey": "g2-test"},
+        }, "recon-2")
+
+        response = ws2.sent[-1]
+        self.assertEqual(response["payload"]["state"], "running")
+        self.assertNotIn("approval", response["payload"])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,8 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "dist-test",
+    "sourceMap": false
+  },
+  "include": ["src/events.ts", "src/audio.ts", "src/config.ts", "src/surface.ts"]
+}

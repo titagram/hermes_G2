@@ -2,11 +2,19 @@
   "package_id": "com.nousresearch.hermesglass",
   "edition": "202601",
   "name": "HermesGlass",
-  "version": "1.0.0",
+  "version": "1.0.3",
   "min_app_version": "2.0.0",
   "min_sdk_version": "0.0.10",
   "entrypoint": "index.html",
   "permissions": [
+    {
+      "name": "network",
+      "desc": "Connect to the HermesGlass WebSocket bridge.",
+      "whitelist": [
+        "wss://titagram.tail005130.ts.net:8448",
+        "ws://titagram.tail005130.ts.net:8448"
+      ]
+    },
     { "name": "g2-microphone", "desc": "Capture voice commands for Hermes Agent." }
   ],
   "supported_languages": ["en"]

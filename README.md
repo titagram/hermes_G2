@@ -185,7 +185,8 @@ there and tap **Save & Connect**:
 
 - Bridge WebSocket URL, for example `wss://titagram.tail005130.ts.net:8448/ws`
 - Optional token
-- Multiple connection profiles for multiple Hermes instances
+- Multiple connection profiles for multiple Hermes instances. Each profile has
+  its own stable G2 session id and event replay cursor.
 - HexStrike target and scope for approved HTB/security workflows
 - STT model, default `whisper-1`
 - Recording timeout
