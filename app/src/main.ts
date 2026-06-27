@@ -44,6 +44,12 @@ import {
 } from './config'
 import { normalizeHubEvent } from './events'
 import {
+  APP_RELEASE_LABEL,
+  type ConfigHelpField,
+  fieldHelp,
+  fieldLabel,
+} from './mobile_ui'
+import {
   type G2Approval,
   type G2Surface,
   type SurfaceItem,
@@ -117,7 +123,10 @@ function initWebView() {
           <h1 class="app-title">HermesGlass</h1>
           <p class="app-subtitle">Even Realities G2 bridge for Hermes Agent</p>
         </div>
-        <div id="webState" class="state-pill">Starting</div>
+        <div class="header-status">
+          <div class="release-pill">${APP_RELEASE_LABEL}</div>
+          <div id="webState" class="state-pill">Starting</div>
+        </div>
       </header>
 
       <section class="app-main">
@@ -125,32 +134,32 @@ function initWebView() {
           <div class="panel-body">
             <div class="profile-row">
               <div>
-                <label class="field-label" for="profileSelect">Profile</label>
+                ${fieldLabel('profileSelect', 'Profile', 'profiles')}
                 <select id="profileSelect" class="config-input"></select>
               </div>
               <div>
-                <label class="field-label" for="profileNameInput">Profile name</label>
+                ${fieldLabel('profileNameInput', 'Profile name', 'profiles')}
                 <input id="profileNameInput" class="config-input" autocomplete="off" spellcheck="false" />
               </div>
             </div>
 
-            <label class="field-label" for="bridgeUrlInput">Bridge WebSocket URL</label>
+            ${fieldLabel('bridgeUrlInput', 'Bridge WebSocket URL', 'bridgeUrl')}
             <input id="bridgeUrlInput" class="config-input" autocomplete="off" spellcheck="false" />
 
-            <label class="field-label field-spaced" for="bridgeTokenInput">Token</label>
+            <div class="field-spaced">${fieldLabel('bridgeTokenInput', 'Token', 'token')}</div>
             <input id="bridgeTokenInput" class="config-input" autocomplete="off" spellcheck="false" type="password" />
 
             <div class="settings-grid">
               <div>
-                <label class="field-label" for="sttModelInput">STT model</label>
+                ${fieldLabel('sttModelInput', 'STT model', 'sttModel')}
                 <input id="sttModelInput" class="config-input" autocomplete="off" spellcheck="false" />
               </div>
               <div>
-                <label class="field-label" for="maxRecordingSecondsInput">Recording seconds</label>
+                ${fieldLabel('maxRecordingSecondsInput', 'Recording seconds', 'recording')}
                 <input id="maxRecordingSecondsInput" class="config-input" type="number" min="3" max="60" step="1" />
               </div>
               <div>
-                <label class="field-label" for="inputModeSelect">Input source</label>
+                ${fieldLabel('inputModeSelect', 'Input source', 'inputMode')}
                 <select id="inputModeSelect" class="config-input">
                   <option value="all">Ring and temples</option>
                   <option value="ring">Ring only</option>
@@ -158,23 +167,31 @@ function initWebView() {
                 </select>
               </div>
               <div>
-                <label class="field-label" for="hexTargetInput">HexStrike target</label>
+                ${fieldLabel('hexTargetInput', 'HexStrike target', 'target')}
                 <input id="hexTargetInput" class="config-input" autocomplete="off" spellcheck="false" placeholder="10.129.22.74" />
               </div>
               <div>
-                <label class="field-label" for="hexScopeInput">HexStrike scope</label>
+                ${fieldLabel('hexScopeInput', 'HexStrike scope', 'scope')}
                 <input id="hexScopeInput" class="config-input" autocomplete="off" spellcheck="false" placeholder="HTB authorized machine" />
               </div>
             </div>
 
-            <div class="button-row">
-              <button id="newProfileButton" class="button secondary" type="button">New Profile</button>
-              <button id="saveProfileButton" class="button secondary" type="button">Save Profile</button>
-              <button id="deleteProfileButton" class="button secondary danger" type="button">Delete Profile</button>
-              <button id="connectButton" class="button" type="button">Save & Connect</button>
-              <button id="testBridgeButton" class="button secondary" type="button">Test Bridge</button>
-              <button id="testPromptButton" class="button secondary" type="button" disabled>Send Test Prompt</button>
-            </div>
+            <div id="fieldHelpPanel" class="help-panel" hidden></div>
+
+            <details class="action-drawer" open>
+              <summary>
+                <span>Controls</span>
+                <span id="profileMeta" class="drawer-meta">Default</span>
+              </summary>
+              <div class="button-grid">
+                <button id="newProfileButton" class="button secondary" type="button">New Profile</button>
+                <button id="saveProfileButton" class="button secondary" type="button">Save Profile</button>
+                <button id="deleteProfileButton" class="button secondary danger" type="button">Delete Profile</button>
+                <button id="connectButton" class="button" type="button">Save & Connect</button>
+                <button id="testBridgeButton" class="button secondary" type="button">Test Bridge</button>
+                <button id="testPromptButton" class="button secondary" type="button" disabled>Send Test Prompt</button>
+              </div>
+            </details>
           </div>
         </section>
 
@@ -215,6 +232,8 @@ function initWebView() {
     ?.addEventListener('click', () => sendTestPrompt().catch(reportFatal))
   document.querySelector<HTMLSelectElement>('#profileSelect')
     ?.addEventListener('change', () => switchProfileFromSelect().catch(reportFatal))
+  document.querySelectorAll<HTMLButtonElement>('.help-button')
+    .forEach((button) => button.addEventListener('click', () => showFieldHelp(button.dataset.helpField)))
 }
 
 function setText(selector: string, value: string) {
@@ -236,6 +255,19 @@ function setWebDisplayStatus(status: string) {
 
 function setWebPreview(content: string) {
   setText('#webPreview', content)
+}
+
+function showFieldHelp(rawField: string | undefined) {
+  if (!rawField) return
+  const panel = document.querySelector<HTMLDivElement>('#fieldHelpPanel')
+  if (!panel) return
+  const field = rawField as ConfigHelpField
+  try {
+    panel.textContent = fieldHelp(field)
+    panel.hidden = false
+  } catch {
+    panel.hidden = true
+  }
 }
 
 function setWebBridgeUrl(url: string) {
@@ -279,6 +311,7 @@ function setWebConfig(config: AppConfig) {
   if (inputModeSelect) inputModeSelect.value = config.inputMode
   if (hexTargetInput) hexTargetInput.value = config.hexTarget
   if (hexScopeInput) hexScopeInput.value = config.hexScope
+  setText('#profileMeta', `${selected.name} | ${APP_RELEASE_LABEL}`)
 }
 
 function renderProfileOptions(config: AppConfig) {

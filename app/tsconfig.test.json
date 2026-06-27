@@ -4,5 +4,5 @@
     "outDir": "dist-test",
     "sourceMap": false
   },
-  "include": ["src/events.ts", "src/audio.ts", "src/config.ts", "src/surface.ts"]
+  "include": ["src/events.ts", "src/audio.ts", "src/config.ts", "src/surface.ts", "src/mobile_ui.ts"]
 }
