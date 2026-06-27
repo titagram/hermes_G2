@@ -17,10 +17,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import binascii
 import json
 import logging
 import os
 import signal
+import tempfile
+import threading
 import time
 import uuid
 from typing import Any, Dict, Optional, Set
@@ -36,12 +40,22 @@ try:
 except ImportError:
     raise SystemExit("aiohttp is required: pip install aiohttp")
 
+from .g2_approval import ApprovalManager, TargetContext
+from .g2_hexstrike import HexStrikeRunner, HexStrikeTargetError, normalize_target
+from .g2_jobs import G2JobManager
+from .g2_state import G2StateStore
+from .g2_surface import build_default_surface, find_surface_item, prompt_for_action
+
 logger = logging.getLogger("hermes-glass")
 
 # ─── defaults ────────────────────────────────────────────────────
 DEFAULT_WS_HOST = "0.0.0.0"
 DEFAULT_WS_PORT = 18790
 DEFAULT_HERMES_URL = "http://127.0.0.1:8642"
+DEFAULT_STT_PROVIDER = "auto"
+DEFAULT_LOCAL_STT_MODEL = "tiny"
+DEFAULT_LOCAL_STT_DEVICE = "cpu"
+DEFAULT_LOCAL_STT_COMPUTE_TYPE = "int8"
 PROTOCOL_VERSION = 3
 DELTA_THRESHOLD = 40  # chars before a delta flush
 
@@ -66,14 +80,46 @@ def make_hello_ok(msg_id: str) -> str:
 
 # ─── Hermes API client ───────────────────────────────────────────
 
+class HermesSttError(RuntimeError):
+    """Hermes returned an error from its OpenAI-compatible STT endpoint."""
+
+    def __init__(self, status: int, body: str):
+        super().__init__(f"Hermes STT API error {status}")
+        self.status = status
+        self.body = body
+
+
 class HermesClient:
     """Thin async client for the Hermes API Server (OpenAI-compatible)."""
 
-    def __init__(self, base_url: str, api_key: str, model: str = "hermes-agent"):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str = "hermes-agent",
+        stt_model: str = "whisper-1",
+        stt_provider: str = DEFAULT_STT_PROVIDER,
+        local_stt_model: str = DEFAULT_LOCAL_STT_MODEL,
+        local_stt_device: str = DEFAULT_LOCAL_STT_DEVICE,
+        local_stt_compute_type: str = DEFAULT_LOCAL_STT_COMPUTE_TYPE,
+        local_stt_language: Optional[str] = None,
+    ):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
+        self.stt_model = stt_model
+        provider = stt_provider.strip().lower()
+        if provider not in {"auto", "hermes", "local"}:
+            raise ValueError("stt_provider must be one of: auto, hermes, local")
+        self.stt_provider = provider
+        self.local_stt_model = local_stt_model
+        self.local_stt_device = local_stt_device
+        self.local_stt_compute_type = local_stt_compute_type
+        self.local_stt_language = local_stt_language or None
         self._session: Optional[aiohttp.ClientSession] = None
+        self._hermes_stt_unavailable = False
+        self._local_stt = None
+        self._local_stt_lock = threading.Lock()
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -125,6 +171,111 @@ class HermesClient:
             logger.error("Hermes API error: %s", exc)
             yield (None, f"[Connection error: {exc}]", None)
 
+    async def transcribe_audio(
+        self,
+        audio_bytes: bytes,
+        filename: str = "g2.wav",
+        mime_type: str = "audio/wav",
+        model: Optional[str] = None,
+    ) -> str:
+        """Transcribe a WAV file through Hermes STT or the local fallback provider."""
+        if self.stt_provider in {"auto", "hermes"} and not self._hermes_stt_unavailable:
+            try:
+                return await self._transcribe_audio_hermes(audio_bytes, filename, mime_type, model)
+            except HermesSttError as exc:
+                logger.error("Hermes STT API %d: %s", exc.status, exc.body[:300])
+                if self.stt_provider == "hermes" or exc.status != 404:
+                    raise
+                self._hermes_stt_unavailable = True
+                logger.warning("Hermes STT endpoint returned 404; using local STT fallback")
+
+        if self.stt_provider in {"auto", "local"}:
+            return await self._transcribe_audio_local(audio_bytes)
+
+        raise RuntimeError("No STT provider is available")
+
+    async def _transcribe_audio_hermes(
+        self,
+        audio_bytes: bytes,
+        filename: str,
+        mime_type: str,
+        model: Optional[str],
+    ) -> str:
+        """POST /v1/audio/transcriptions with a WAV file. Returns transcript text."""
+        session = await self._get_session()
+        form = aiohttp.FormData()
+        form.add_field("model", model or self.stt_model)
+        form.add_field("file", audio_bytes, filename=filename, content_type=mime_type)
+        url = f"{self.base_url}/v1/audio/transcriptions"
+
+        async with session.post(url, data=form) as resp:
+            body = await resp.text()
+            if resp.status != 200:
+                raise HermesSttError(resp.status, body)
+            try:
+                data = json.loads(body)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("Hermes STT returned invalid JSON") from exc
+            text = data.get("text") or data.get("transcript") or data.get("result") or ""
+            return str(text).strip()
+
+    async def _transcribe_audio_local(self, audio_bytes: bytes) -> str:
+        return await asyncio.to_thread(self._transcribe_audio_local_sync, audio_bytes)
+
+    def _load_local_stt(self):
+        with self._local_stt_lock:
+            if self._local_stt is not None:
+                return self._local_stt
+            try:
+                from faster_whisper import WhisperModel
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Local STT requires faster-whisper. Install bridge requirements "
+                    "or set HERMES_STT_PROVIDER=hermes."
+                ) from exc
+
+            logger.info(
+                "Loading local STT model %s (device=%s, compute_type=%s)",
+                self.local_stt_model,
+                self.local_stt_device,
+                self.local_stt_compute_type,
+            )
+            self._local_stt = WhisperModel(
+                self.local_stt_model,
+                device=self.local_stt_device,
+                compute_type=self.local_stt_compute_type,
+            )
+            return self._local_stt
+
+    def _transcribe_audio_local_sync(self, audio_bytes: bytes) -> str:
+        model = self._load_local_stt()
+        tmp_name = ""
+        try:
+            with tempfile.NamedTemporaryFile(prefix="hermes-g2-", suffix=".wav", delete=False) as fh:
+                fh.write(audio_bytes)
+                tmp_name = fh.name
+
+            segments, info = model.transcribe(
+                tmp_name,
+                beam_size=1,
+                vad_filter=True,
+                language=self.local_stt_language,
+            )
+            parts = [segment.text.strip() for segment in segments if segment.text and segment.text.strip()]
+            text = " ".join(parts).strip()
+            logger.info(
+                "Local STT transcribed %.2fs audio to %d chars",
+                getattr(info, "duration", 0.0) or 0.0,
+                len(text),
+            )
+            return text
+        finally:
+            if tmp_name:
+                try:
+                    os.unlink(tmp_name)
+                except OSError:
+                    pass
+
     async def close(self):
         if self._session and not self._session.closed:
             await self._session.close()
@@ -134,13 +285,27 @@ class HermesClient:
 class BridgeConnection:
     """One client WebSocket connection."""
 
-    def __init__(self, ws, hermes: HermesClient, conn_id: str):
+    def __init__(
+        self,
+        ws,
+        hermes: HermesClient,
+        conn_id: str,
+        state_store: Optional[G2StateStore] = None,
+        job_manager: Optional[G2JobManager] = None,
+    ):
         self.ws = ws
         self.hermes = hermes
         self.conn_id = conn_id
         self.session_id: Optional[str] = None
+        self.g2_session_id: Optional[str] = None
         self.agent_id = "hermes-main"
         self.subscribed: Set[str] = set()
+        self.target = TargetContext()
+        self.approvals = ApprovalManager()
+        self.hex_runner = HexStrikeRunner()
+        self.state_store = state_store
+        self.job_manager = job_manager
+        self._job_unsubscribe = None
 
     async def handle(self):
         """Main read loop for aiohttp WebSocketResponse."""
@@ -166,6 +331,9 @@ class BridgeConnection:
                     await self._process_line(line)
         except Exception as exc:
             logger.info("Connection %s ended: %s", self.conn_id, exc)
+        if self._job_unsubscribe is not None:
+            self._job_unsubscribe()
+            self._job_unsubscribe = None
         logger.info("Connection %s closed", self.conn_id)
 
     async def _process_line(self, line: str):
@@ -194,11 +362,74 @@ class BridgeConnection:
             logger.info("Handshake ok for %s (protocol %d)", self.conn_id, PROTOCOL_VERSION)
             return
 
+        if method == "bridge.capabilities":
+            await self.ws.send_str(make_response(msg_id, {
+                "audioTranscribe": True,
+                "bootstrap": True,
+                "configVersion": 2,
+                "defaultSttModel": self.hermes.stt_model,
+                "g2Approvals": True,
+                "g2Surface": True,
+                "g2Targets": True,
+                "sttProvider": self.hermes.stt_provider,
+                "localSttModel": self.hermes.local_stt_model,
+                "protocol": PROTOCOL_VERSION,
+                "surfaceVersion": 2,
+            }))
+            return
+
+        if method == "g2.session.resume":
+            await self._handle_g2_session_resume(msg_id, params)
+            return
+
+        if method in {"g2.surface.get", "g2.surface.refresh"}:
+            await self.ws.send_str(make_response(msg_id, self._build_surface()))
+            return
+
+        if method == "g2.target.get":
+            await self.ws.send_str(make_response(msg_id, self._target_payload()))
+            return
+
+        if method == "g2.target.set":
+            await self._handle_g2_target_set(msg_id, params)
+            return
+
+        if method == "g2.approval.list":
+            await self.ws.send_str(make_response(msg_id, {"approvals": self.approvals.pending()}))
+            return
+
+        if method == "g2.approval.respond":
+            await self._handle_g2_approval_respond(msg_id, params)
+            return
+
+        if method == "g2.bootstrap.status":
+            await self.ws.send_str(make_response(msg_id, {
+                "installed": False,
+                "plugin": "hermes-g2",
+                "expectedVersion": "0.1.0",
+                "installAvailable": True,
+                "method": "hermes_plugin_install",
+                "message": "Hermes G2 plugin bootstrap is not installed yet.",
+            }))
+            return
+
+        if method == "g2.action.run":
+            await self._handle_g2_action_run(msg_id, params)
+            return
+
+        if method.startswith("g2."):
+            await self.ws.send_str(make_error(msg_id, 404, f"unknown G2 method: {method}"))
+            return
+
         if method == "chat.send":
             text = params.get("message", "")
             session_key = params.get("sessionKey", self.agent_id)
             await self.ws.send_str(make_response(msg_id, {"accepted": True}))
             asyncio.create_task(self._handle_chat(session_key, text))
+            return
+
+        if method == "audio.transcribe":
+            await self._handle_audio_transcribe(msg_id, params)
             return
 
         if method == "chat.subscribe":
@@ -217,6 +448,326 @@ class BridgeConnection:
 
         # Generic ack
         await self.ws.send_str(make_response(msg_id, {"ok": True}))
+
+    async def _handle_g2_action_run(self, msg_id: str, params: dict):
+        action_id = params.get("id", "")
+        if not isinstance(action_id, str) or not action_id.strip():
+            await self.ws.send_str(make_error(msg_id, 400, "action id is required"))
+            return
+
+        action_id = action_id.strip()
+        if action_id.startswith("approval:"):
+            approval_id = action_id.split(":", 1)[1]
+            approval = self.approvals.get(approval_id)
+            if approval is None:
+                await self.ws.send_str(make_error(msg_id, 404, f"unknown approval: {approval_id}"))
+                return
+            await self.ws.send_str(make_response(msg_id, {"state": "approval", "approval": approval}))
+            return
+
+        surface = self._build_surface(agent_state="busy")
+        item = find_surface_item(surface, action_id)
+        if item is None:
+            await self.ws.send_str(make_error(msg_id, 404, f"unknown action: {action_id}"))
+            return
+
+        item_type = item.get("type")
+        if item_type == "data":
+            await self.ws.send_str(make_response(msg_id, {"state": "detail", "item": item}))
+            return
+
+        if item_type == "voice":
+            await self.ws.send_str(make_response(msg_id, {"state": "voice", "item": item}))
+            return
+
+        if item_type != "action":
+            await self.ws.send_str(make_error(msg_id, 400, f"unsupported item type: {item_type}"))
+            return
+
+        if action_id == "hex_recon":
+            await self._handle_hex_recon_action(msg_id, params)
+            return
+
+        prompt = prompt_for_action(action_id)
+        if not prompt:
+            await self.ws.send_str(make_error(msg_id, 404, f"no prompt configured for action: {action_id}"))
+            return
+
+        session_key = params.get("sessionKey", self.agent_id)
+        if not isinstance(session_key, str) or not session_key.strip():
+            session_key = self.agent_id
+
+        await self.ws.send_str(make_response(msg_id, {
+            "accepted": True,
+            "state": "running",
+            "id": action_id,
+            "sessionKey": session_key,
+        }))
+        asyncio.create_task(self._handle_chat(session_key, prompt))
+
+    def _build_surface(self, agent_state: str = "idle") -> dict:
+        active_jobs = []
+        if self.state_store is not None and self.g2_session_id is not None:
+            active_jobs = self.state_store.jobs_for_session(self.g2_session_id)[:3]
+        return build_default_surface(
+            agent_state=agent_state,
+            target=self.target,
+            pending_approvals=self.approvals.pending(),
+            active_jobs=active_jobs,
+        )
+
+    def _target_payload(self) -> dict:
+        return {
+            "target": self.target.target,
+            "scope": self.target.scope,
+        }
+
+    async def _handle_g2_session_resume(self, msg_id: str, params: dict):
+        if self.state_store is None:
+            await self.ws.send_str(make_error(msg_id, 503, "G2 session store is not available"))
+            return
+
+        client_session_id = params.get("clientSessionId", "")
+        profile_id = params.get("profileId", "default")
+        if not isinstance(client_session_id, str) or not client_session_id.strip():
+            await self.ws.send_str(make_error(msg_id, 400, "clientSessionId is required"))
+            return
+        if not isinstance(profile_id, str) or not profile_id.strip():
+            profile_id = "default"
+
+        try:
+            last_seen_event_id = int(params.get("lastSeenEventId") or 0)
+        except (TypeError, ValueError):
+            last_seen_event_id = 0
+
+        target = params.get("target", "")
+        scope = params.get("scope", "")
+        target_value = normalize_target(target) if isinstance(target, str) and target.strip() else ""
+        scope_value = scope.strip() if isinstance(scope, str) else ""
+
+        try:
+            restored = self.state_store.resume_session(
+                client_session_id=client_session_id,
+                profile_id=profile_id,
+                target=target_value,
+                scope=scope_value,
+                last_seen_event_id=last_seen_event_id,
+            )
+        except ValueError as exc:
+            await self.ws.send_str(make_error(msg_id, 400, str(exc)))
+            return
+
+        self.g2_session_id = restored["session"]["id"]
+        self.target = TargetContext(
+            target=str(restored.get("target", {}).get("target") or ""),
+            scope=str(restored.get("target", {}).get("scope") or ""),
+        )
+        self._restore_approvals(restored)
+        self._subscribe_job_events()
+
+        await self.ws.send_str(make_response(msg_id, self._resume_payload(restored)))
+
+    def _restore_approvals(self, restored: dict) -> None:
+        self.approvals = ApprovalManager()
+        for record in restored.get("pendingApprovals", []):
+            if not isinstance(record, dict):
+                continue
+            approval = record.get("approval")
+            if isinstance(approval, dict):
+                self.approvals.restore_pending(approval, str(record.get("prompt") or ""))
+        for grant in restored.get("activeGrants", []):
+            if not isinstance(grant, dict):
+                continue
+            self.approvals.restore_grant(
+                target=str(grant.get("target") or ""),
+                workflow=str(grant.get("workflow") or ""),
+                risk_ceiling=str(grant.get("riskCeiling") or "low"),
+                expires_at_ms=int(grant.get("expiresAt") or 0),
+            )
+
+    def _resume_payload(self, restored: dict) -> dict:
+        return {
+            "session": restored["session"],
+            "target": restored["target"],
+            "pendingApprovals": [
+                record["approval"]
+                for record in restored.get("pendingApprovals", [])
+                if isinstance(record, dict) and isinstance(record.get("approval"), dict)
+            ],
+            "activeGrants": restored.get("activeGrants", []),
+            "jobs": restored.get("jobs", []),
+            "missedEvents": restored.get("missedEvents", []),
+        }
+
+    def _subscribe_job_events(self) -> None:
+        if self.job_manager is None or self.g2_session_id is None:
+            return
+        if self._job_unsubscribe is not None:
+            self._job_unsubscribe()
+            self._job_unsubscribe = None
+
+        async def send_job_event(event_name: str, payload: dict):
+            await self.ws.send_str(make_event(event_name, payload))
+
+        self._job_unsubscribe = self.job_manager.subscribe(self.g2_session_id, send_job_event)
+
+    async def _handle_g2_target_set(self, msg_id: str, params: dict):
+        raw_target = params.get("target", "")
+        raw_scope = params.get("scope", "")
+        target = normalize_target(raw_target) if isinstance(raw_target, str) else ""
+        scope = raw_scope.strip() if isinstance(raw_scope, str) else ""
+        if len(target) > 128 or len(scope) > 240:
+            await self.ws.send_str(make_error(msg_id, 400, "target or scope is too long"))
+            return
+        self.target = TargetContext(target=target, scope=scope)
+        if self.state_store is not None and self.g2_session_id is not None:
+            self.state_store.set_target(self.g2_session_id, target, scope)
+        await self.ws.send_str(make_response(msg_id, self._target_payload()))
+
+    async def _handle_hex_recon_action(self, msg_id: str, params: dict):
+        target = self.target.target.strip()
+        if not target:
+            await self.ws.send_str(make_error(msg_id, 400, "HexStrike target is required"))
+            return
+        try:
+            normalized_target = self.hex_runner.validate_target(target)
+        except HexStrikeTargetError as exc:
+            await self.ws.send_str(make_error(msg_id, 400, str(exc)))
+            return
+        if normalized_target != target:
+            self.target = TargetContext(target=normalized_target, scope=self.target.scope)
+            target = normalized_target
+
+        session_key = params.get("sessionKey", self.agent_id)
+        if not isinstance(session_key, str) or not session_key.strip():
+            session_key = self.agent_id
+
+        prompt = self._hex_recon_prompt()
+        if self.approvals.is_granted(target, "hexstrike-recon", "low"):
+            await self.ws.send_str(make_response(msg_id, {
+                "accepted": True,
+                "state": "running",
+                "id": "hex_recon",
+                "sessionKey": session_key,
+                "grant": "session",
+            }))
+            asyncio.create_task(self._start_hex_recon(session_key, self.target))
+            return
+
+        approval = self.approvals.create_recon_approval(self.target, prompt=prompt)
+        if self.state_store is not None and self.g2_session_id is not None:
+            self.state_store.save_approval(self.g2_session_id, approval, prompt=prompt)
+            self.state_store.append_event(self.g2_session_id, "g2.approval.requested", {
+                "approval": approval,
+            })
+        await self.ws.send_str(make_response(msg_id, {"state": "approval", "approval": approval}))
+
+    def _hex_recon_prompt(self) -> str:
+        scope = self.target.scope.strip() or "authorized security testing scope"
+        target = self.target.target.strip()
+        return (
+            "Use the hexstrike-kali-htb skill. "
+            f"Target {target} is authorized under scope: {scope}. "
+            "Recover current engagement state, then perform or propose only non-destructive "
+            "reconnaissance appropriate to the selected G2 approval grant. "
+            "Use HexStrike/Hermes MCP when helpful, keep the final answer concise for G2, "
+            "and update the rolling professional report when material observations are found."
+        )
+
+    async def _handle_g2_approval_respond(self, msg_id: str, params: dict):
+        approval_id = params.get("id", "")
+        option_id = params.get("optionId", "")
+        if not isinstance(approval_id, str) or not approval_id.strip():
+            await self.ws.send_str(make_error(msg_id, 400, "approval id is required"))
+            return
+        if not isinstance(option_id, str) or not option_id.strip():
+            await self.ws.send_str(make_error(msg_id, 400, "approval optionId is required"))
+            return
+
+        result = self.approvals.respond(approval_id.strip(), option_id.strip())
+        if result.get("state") == "missing":
+            await self.ws.send_str(make_error(msg_id, 404, str(result.get("error") or "approval not found")))
+            return
+
+        prompt = result.pop("prompt", None)
+        workflow = result.pop("workflow", "")
+        approved_target = TargetContext(
+            target=str(result.pop("target", "") or self.target.target),
+            scope=str(result.pop("scope", "") or self.target.scope),
+        )
+        session_key = params.get("sessionKey", self.agent_id)
+        if not isinstance(session_key, str) or not session_key.strip():
+            session_key = self.agent_id
+        if result.get("state") == "running":
+            result["sessionKey"] = session_key
+        if result.get("state") in {"running", "denied"}:
+            self._persist_approval_result(approval_id.strip(), result, approved_target, workflow)
+
+        await self.ws.send_str(make_response(msg_id, result))
+        if result.get("state") == "running" and workflow == "hexstrike-recon":
+            asyncio.create_task(self._start_hex_recon(session_key, approved_target))
+        elif isinstance(prompt, str) and prompt:
+            asyncio.create_task(self._handle_chat(session_key, prompt))
+
+    def _persist_approval_result(
+        self,
+        approval_id: str,
+        result: dict,
+        approved_target: TargetContext,
+        workflow: str,
+    ) -> None:
+        if self.state_store is None or self.g2_session_id is None:
+            return
+        state = str(result.get("state") or "")
+        self.state_store.resolve_approval(self.g2_session_id, approval_id, state)
+        grant = result.get("grant")
+        if isinstance(grant, dict) and grant.get("kind") == "approve_session":
+            ttl_minutes = int(grant.get("ttlMinutes") or 0)
+            self.state_store.save_grant(
+                self.g2_session_id,
+                target=approved_target.target,
+                workflow=workflow,
+                risk_ceiling=str(grant.get("riskCeiling") or "low"),
+                ttl_seconds=max(1, ttl_minutes) * 60,
+                source_channel="glasses",
+            )
+
+    async def _start_hex_recon(self, session_key: str, target: TargetContext) -> None:
+        if self.job_manager is not None and self.g2_session_id is not None:
+            await self.job_manager.start_recon(self.g2_session_id, target, session_key=session_key)
+            return
+        await self._handle_hex_recon(session_key, target)
+
+    async def _handle_audio_transcribe(self, msg_id: str, params: dict):
+        audio_b64 = params.get("audioBase64", "")
+        mime_type = params.get("mimeType", "audio/wav")
+        if not isinstance(audio_b64, str) or not audio_b64:
+            await self.ws.send_str(make_error(msg_id, 400, "audioBase64 is required"))
+            return
+
+        try:
+            audio_bytes = base64.b64decode(audio_b64, validate=True)
+        except (binascii.Error, ValueError):
+            await self.ws.send_str(make_error(msg_id, 400, "audioBase64 is invalid"))
+            return
+
+        if len(audio_bytes) > 1_200_000:
+            await self.ws.send_str(make_error(msg_id, 413, "audio payload is too large"))
+            return
+
+        try:
+            stt_model = params.get("sttModel")
+            text = await self.hermes.transcribe_audio(
+                audio_bytes,
+                mime_type=mime_type,
+                model=stt_model if isinstance(stt_model, str) and stt_model.strip() else None,
+            )
+        except Exception as exc:
+            logger.error("STT failed for %s: %s", self.conn_id, exc)
+            await self.ws.send_str(make_error(msg_id, 502, str(exc)))
+            return
+
+        await self.ws.send_str(make_response(msg_id, {"text": text}))
 
     async def _handle_chat(self, session_key: str, text: str):
         """Stream a chat turn, emitting OpenClaw-format events."""
@@ -273,6 +824,57 @@ class BridgeConnection:
         }))
         logger.info("Chat done %s (run %s, %d chars)", self.conn_id, run_id[:8], len(accumulated))
 
+    async def _handle_hex_recon(self, session_key: str, target: TargetContext):
+        """Run the bounded HexStrike worker and stream concise status to G2."""
+        run_id = str(uuid.uuid4())
+        ts = int(time.time() * 1000)
+        await self.ws.send_str(make_event("agent.event", {
+            "runId": run_id, "seq": 0, "stream": self.agent_id,
+            "ts": ts, "data": {"sessionKey": session_key, "status": "busy"},
+        }))
+
+        accumulated = ""
+        seq = 0
+        status = "ok"
+        try:
+            async for line in self.hex_runner.stream_recon(target):
+                clean = str(line).strip()
+                if not clean:
+                    continue
+                accumulated = (accumulated + "\n" + clean).strip()[-1800:]
+                seq += 1
+                await self.ws.send_str(make_event("chat.event", {
+                    "runId": run_id, "sessionKey": session_key,
+                    "seq": seq, "state": "delta",
+                    "message": {"role": "assistant", "content": accumulated},
+                }))
+        except Exception as exc:
+            status = "error"
+            accumulated = f"HexStrike recon failed: {exc}"
+            logger.exception("HexStrike recon failed for %s", target.target)
+
+        if not accumulated:
+            accumulated = "HexStrike recon finished without output."
+
+        seq += 1
+        await self.ws.send_str(make_event("chat.event", {
+            "runId": run_id, "sessionKey": session_key,
+            "seq": seq, "state": "final",
+            "message": {"role": "assistant", "content": accumulated},
+            "stopReason": "stop" if status == "ok" else "error",
+        }))
+        await self.ws.send_str(make_event("agent.event", {
+            "runId": run_id, "seq": seq + 1, "stream": self.agent_id,
+            "ts": int(time.time() * 1000),
+            "data": {"sessionKey": session_key, "status": "idle"},
+        }))
+        await self.ws.send_str(make_event("agent.completion", {
+            "agentId": self.agent_id, "sessionKey": session_key,
+            "runId": run_id, "status": status,
+            "result": accumulated, "timestamp": int(time.time() * 1000),
+        }))
+        logger.info("HexStrike recon done %s (run %s, status=%s)", self.conn_id, run_id[:8], status)
+
 # ─── Unified aiohttp server (HTTP + WebSocket on same port) ─────
 # This is critical for Tailscale serve: it does HTTPS->HTTP reverse proxy
 # and needs the backend to handle both HTTP GET (health) and WS upgrade
@@ -295,6 +897,8 @@ async def http_health(request: web.Request) -> web.Response:
         "hermes_api": hermes_ok,
         "hermes_version": hermes_status.get("version", "?"),
         "hermes_platform": hermes_status.get("platform", "?"),
+        "stt_provider": hermes.stt_provider,
+        "local_stt_model": hermes.local_stt_model,
     })
 
 async def http_root(request: web.Request) -> web.Response:
@@ -312,17 +916,47 @@ async def http_root(request: web.Request) -> web.Response:
 async def ws_handler(request: web.Request) -> web.StreamResponse:
     """Handle a WebSocket upgrade from the glasses (or test client)."""
     hermes: HermesClient = request.app["hermes_client"]
-    ws = web.WebSocketResponse(heartbeat=30, max_msg_size=2**20)
+    state_store: G2StateStore = request.app["g2_state_store"]
+    job_manager: G2JobManager = request.app["g2_job_manager"]
+    ws = web.WebSocketResponse(heartbeat=30, max_msg_size=2**22)
     await ws.prepare(request)
 
     conn_id = str(uuid.uuid4())[:8]
-    conn = BridgeConnection(ws, hermes, conn_id)
+    conn = BridgeConnection(
+        ws,
+        hermes,
+        conn_id,
+        state_store=state_store,
+        job_manager=job_manager,
+    )
     await conn.handle()
     return ws
 
-def create_app(hermes_url: str, hermes_key: str, hermes_model: str) -> web.Application:
+def create_app(
+    hermes_url: str,
+    hermes_key: str,
+    hermes_model: str,
+    hermes_stt_model: str,
+    stt_provider: str,
+    local_stt_model: str,
+    local_stt_device: str,
+    local_stt_compute_type: str,
+    local_stt_language: Optional[str],
+) -> web.Application:
     app = web.Application()
-    app["hermes_client"] = HermesClient(hermes_url, hermes_key, hermes_model)
+    app["hermes_client"] = HermesClient(
+        hermes_url,
+        hermes_key,
+        hermes_model,
+        hermes_stt_model,
+        stt_provider=stt_provider,
+        local_stt_model=local_stt_model,
+        local_stt_device=local_stt_device,
+        local_stt_compute_type=local_stt_compute_type,
+        local_stt_language=local_stt_language,
+    )
+    app["g2_state_store"] = G2StateStore()
+    app["g2_job_manager"] = G2JobManager(app["g2_state_store"])
     app.router.add_get("/", http_root)
     app.router.add_get("/health", http_health)
     app.router.add_get("/ws", ws_handler)
@@ -332,7 +966,17 @@ def create_app(hermes_url: str, hermes_key: str, hermes_model: str) -> web.Appli
 
 async def main_async(args):
     from aiohttp import web
-    app = create_app(args.hermes_url, args.hermes_key, args.hermes_model)
+    app = create_app(
+        args.hermes_url,
+        args.hermes_key,
+        args.hermes_model,
+        args.hermes_stt_model,
+        args.stt_provider,
+        args.local_stt_model,
+        args.local_stt_device,
+        args.local_stt_compute_type,
+        args.local_stt_language,
+    )
 
     # Also keep the old health on port+1 for backwards compat
     health_port = args.port + 1
@@ -346,7 +990,14 @@ async def main_async(args):
     logger.info("Legacy health on http://0.0.0.0:%d/health", health_port)
 
     logger.info("HermesGlass Bridge on %s:%d (WS+HTTP)", args.host, args.port)
-    logger.info("Hermes API: %s (model: %s)", args.hermes_url, args.hermes_model)
+    logger.info(
+        "Hermes API: %s (chat model: %s, STT provider: %s, Hermes STT model: %s, local STT model: %s)",
+        args.hermes_url,
+        args.hermes_model,
+        args.stt_provider,
+        args.hermes_stt_model,
+        args.local_stt_model,
+    )
 
     runner2 = web.AppRunner(app)
     await runner2.setup()
@@ -361,6 +1012,14 @@ def main():
     parser.add_argument("--hermes-url", default=os.getenv("HERMES_URL", DEFAULT_HERMES_URL))
     parser.add_argument("--hermes-key", default=os.getenv("API_SERVER_KEY", ""))
     parser.add_argument("--hermes-model", default=os.getenv("HERMES_MODEL", "hermes-agent"))
+    parser.add_argument("--hermes-stt-model", default=os.getenv("HERMES_STT_MODEL", "whisper-1"))
+    parser.add_argument("--stt-provider", choices=("auto", "hermes", "local"),
+                        default=os.getenv("HERMES_STT_PROVIDER", DEFAULT_STT_PROVIDER))
+    parser.add_argument("--local-stt-model", default=os.getenv("HERMES_LOCAL_STT_MODEL", DEFAULT_LOCAL_STT_MODEL))
+    parser.add_argument("--local-stt-device", default=os.getenv("HERMES_LOCAL_STT_DEVICE", DEFAULT_LOCAL_STT_DEVICE))
+    parser.add_argument("--local-stt-compute-type",
+                        default=os.getenv("HERMES_LOCAL_STT_COMPUTE_TYPE", DEFAULT_LOCAL_STT_COMPUTE_TYPE))
+    parser.add_argument("--local-stt-language", default=os.getenv("HERMES_LOCAL_STT_LANGUAGE") or None)
     parser.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"))
     args = parser.parse_args()
 
