@@ -16,6 +16,7 @@ hermes-g2-bridge/
 │   ├── __init__.py
 │   ├── bridge_server.py      # WebSocket server (OpenClaw protocol → Hermes API)
 │   ├── g2_approval.py        # G2 approval queue and bounded session grants
+│   ├── g2_hexstrike.py       # Bounded direct HexStrike worker for G2 recon
 │   └── g2_surface.py         # Semantic G2 surface/actions model
 ├── app/                      # Even Hub app (Vite + TypeScript + Even Hub SDK)
 │   ├── app.json              # Even Hub manifest
@@ -163,6 +164,12 @@ Environment variables (or CLI flags):
 | `HERMES_LOCAL_STT_DEVICE` | `cpu` | faster-whisper device, for example `cpu` or `cuda` |
 | `HERMES_LOCAL_STT_COMPUTE_TYPE` | `int8` | faster-whisper compute type |
 | `HERMES_LOCAL_STT_LANGUAGE` | (auto) | Optional language code such as `it` or `en` |
+| `G2_HEXSTRIKE_PROJECT_DIR` | `/home/titagram/hexstrike-kali-hermes` | HexStrike/Kali helper project directory |
+| `G2_HEXSTRIKE_SCRIPT` | `<project>/run-lan-scan.sh` | Bounded scan wrapper used by the G2 `RECON` action |
+| `G2_HEXSTRIKE_REPORT_BASE_URL` | `https://titagram.tail005130.ts.net:8899` | Report base URL shown on G2 |
+| `G2_HEXSTRIKE_ALLOWED_CIDRS` | `10.0.0.0/8,172.16.0.0/12,192.168.0.0/16` | Comma-separated target ranges allowed for direct G2 recon |
+| `G2_HEXSTRIKE_PROFILE` | `quick` | Scan wrapper profile, usually `quick` |
+| `G2_HEXSTRIKE_EXTRA_NMAP` | `--host-timeout 60s --max-retries 2` | Extra bounded nmap args passed to the wrapper |
 | `LOG_LEVEL` | `INFO` | Logging level |
 
 ### Even Hub App
@@ -218,13 +225,19 @@ Bridge → Glasses:  {type: "event", event: "chat.event", payload: {state: "fina
 Bridge → Glasses:  {type: "event", event: "agent.completion", payload: {status: "ok", result: "..."}}
 ```
 
-The bridge translates this to Hermes API Server calls:
+The bridge translates normal chat and voice turns to Hermes API Server calls:
 
 ```
 Bridge → Hermes:  POST /v1/chat/completions  {model: "hermes-agent", messages: [...], stream: true}
 Hermes → Bridge:  SSE data: {choices: [{delta: {content: "..."}}]}
                   data: [DONE]
 ```
+
+The G2 `RECON` action is intentionally narrower. After G2 approval, the
+bridge runs the bounded HexStrike wrapper directly and streams status lines
+back as `chat.event` updates. This avoids sending a broad prompt to Hermes
+that can trigger invisible Hermes-side tool approvals or long-running agent
+loops before the glasses receive feedback.
 
 ### G2 Surface Contract
 
@@ -246,14 +259,15 @@ The G2 app sends only action ids back to the bridge. Prompts remain server-side.
 
 ### HexStrike Approval Workflow
 
-If Hermes has the `hexstrike-kali-htb` skill and the `hexstrike` MCP server
-configured, the bridge can expose a controlled `RECON` action. The mobile
-Even Hub configuration screen supplies the current target and scope. The
-glasses never need to type the target directly.
+If the HexStrike/Kali helper project is installed on the bridge host, the
+bridge can expose a controlled `RECON` action. The mobile Even Hub
+configuration screen supplies the current target and scope. The glasses never
+need to type the target directly.
 
-When `RECON` is selected, the bridge creates a structured approval request
-instead of immediately launching the workflow. The G2 display shows configurable
-options supplied by the bridge:
+When `RECON` is selected, the bridge normalizes and validates the target
+against `G2_HEXSTRIKE_ALLOWED_CIDRS`, then creates a structured approval
+request instead of immediately launching the workflow. The G2 display shows
+configurable options supplied by the bridge:
 
 - `ONCE`: approve only this operation.
 - `SESSION LOW`: approve similar low-risk operations for the same target and
@@ -265,8 +279,13 @@ options supplied by the bridge:
   approval.
 
 Session approvals are bounded by target, workflow, risk ceiling and TTL. If
-Hermes/HexStrike needs a higher-risk operation, a different workflow, or a
-different target, the bridge must ask again.
+HexStrike needs a higher-risk operation, a different workflow, or a different
+target, the bridge must ask again.
+
+Targets such as `192.168.1.0 /24` or `192.168.1.0 \24` are normalized to
+`192.168.1.0/24`. Public ranges are rejected by default; for example
+`192.169.1.0/24` will not run unless explicitly added to
+`G2_HEXSTRIKE_ALLOWED_CIDRS`.
 
 ## Adding STT (Speech-to-Text)
 

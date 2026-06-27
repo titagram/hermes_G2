@@ -50,6 +50,7 @@ class ApprovalManager:
             "id": approval_id,
             "title": "Quick recon",
             "target": target_value,
+            "scope": target.scope.strip(),
             "workflow": "hexstrike-recon",
             "risk": "low",
             "reason": "Run non-destructive service reconnaissance.",
@@ -58,8 +59,9 @@ class ApprovalManager:
                 f"Target: {target_value or 'not set'}\n"
                 f"Scope: {target.scope.strip() or 'not set'}\n"
                 "Risk: low\n"
-                "Hermes will use the hexstrike-kali-htb skill and only perform "
-                "read-only reconnaissance unless another approval is requested."
+                "HermesGlass will run the bounded HexStrike quick recon wrapper "
+                "and only perform read-only reconnaissance unless another "
+                "approval is requested."
             ),
             "options": [
                 {"id": "once", "label": "ONCE", "kind": "approve_once"},
@@ -133,6 +135,9 @@ class ApprovalManager:
             "accepted": True,
             "id": approval_id,
             "prompt": record.prompt,
+            "target": str(record.approval.get("target") or ""),
+            "scope": str(record.approval.get("scope") or ""),
+            "workflow": str(record.approval.get("workflow") or ""),
             "grant": option,
         }
 

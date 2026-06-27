@@ -6,7 +6,7 @@ Add a G2-first approval and target flow for Hermes HexStrike workflows. The glas
 
 ## Scope
 
-This design covers the first controlled HexStrike workflow path through the Hermes G2 bridge. It does not try to expose all HexStrike MCP tools directly to the glasses and does not make the glasses talk to HexStrike. Hermes remains the orchestrator.
+This design covers the first controlled HexStrike workflow path through the Hermes G2 bridge. It does not try to expose all HexStrike MCP tools directly to the glasses and does not make the glasses talk to HexStrike. Chat and voice still route through Hermes; the first G2 `RECON` action uses a bounded server-side HexStrike worker so the glasses receive deterministic progress and do not wait on invisible Hermes-side tool approvals.
 
 ## Architecture
 
@@ -16,10 +16,10 @@ The bridge owns a small approval bus per WebSocket connection. G2 actions that r
 G2 app
   -> g2.target.set / g2.surface.get / g2.action.run
   -> bridge approval bus
-  -> Hermes prompt workflow
-  -> Hermes skill hexstrike-kali-htb
-  -> MCP hexstrike
+  -> bounded HexStrike runner
+  -> run-lan-scan.sh
   -> Kali container / HexStrike server
+  -> streamed G2 chat.event progress + report URL
 ```
 
 ## Target And Scope
@@ -43,7 +43,9 @@ After connecting, the app sends:
 }
 ```
 
-If no mobile target is set, the bridge may infer current engagement state from `~/hexstrike-kali-hermes/reports/engagements/CURRENT`. No scan workflow may start unless a target is available.
+If no mobile target is set, no scan workflow may start. Targets are normalized for common G2/mobile entry mistakes such as `192.168.1.0 /24` or `192.168.1.0 \24`.
+
+The direct G2 worker validates targets against `G2_HEXSTRIKE_ALLOWED_CIDRS`; defaults allow private lab ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`). Public CIDRs such as `192.169.1.0/24` are rejected unless explicitly allowlisted on the server.
 
 ## Surface Items
 
@@ -70,7 +72,7 @@ The G2 home remains a server-driven list. The app should not hard-code HexStrike
     "workflow": "hexstrike-recon",
     "risk": "low",
     "reason": "Run non-destructive service reconnaissance.",
-    "detail": "Hermes will use the hexstrike-kali-htb skill and only read service metadata.",
+    "detail": "HermesGlass will run a bounded HexStrike quick recon wrapper and only read service metadata.",
     "options": [
       {"id": "once", "label": "ONCE", "kind": "approve_once"},
       {"id": "session-low", "label": "SESSION LOW", "kind": "approve_session", "riskCeiling": "low", "ttlMinutes": 30},
@@ -123,11 +125,14 @@ The bridge must not show session options that it is not willing to enforce. If a
 
 ## First Workflow
 
-`RECON` starts a read-only prompt to Hermes:
+`RECON` starts a bounded worker on the bridge host after approval or an applicable session grant:
 
-> Use the `hexstrike-kali-htb` skill. Target `<target>` is authorized under scope `<scope>`. Recover current engagement state, then perform or propose only non-destructive reconnaissance appropriate to the selected approval grant. Keep output concise for G2 and update the rolling report.
+```bash
+cd /home/titagram/hexstrike-kali-hermes
+./run-lan-scan.sh --targets "<target>" --name "g2-<target-slug>" --profile quick --extra-nmap "--host-timeout 60s --max-retries 2"
+```
 
-The bridge sends the prompt only after approval or an applicable session grant.
+The bridge streams wrapper output as `chat.event` deltas and sends a final message with the report URL.
 
 ## Safety
 
@@ -135,7 +140,7 @@ The first implementation supports `low` and `medium` session grants. No `high` o
 
 ## Verification
 
-- Unit tests for target normalization, HexStrike status item fallback, pending approval surface item, approval response outcomes and session grant reuse.
+- Unit tests for target normalization/allowlisting, HexStrike status item fallback, pending approval surface item, approval response outcomes and session grant reuse.
 - App tests for approval normalization and option rows.
 - Simulator test for approval list rendering and selecting `DETAIL`/`ONCE`.
 - Remote probe against `wss://titagram.tail005130.ts.net:8448/ws` after deployment.

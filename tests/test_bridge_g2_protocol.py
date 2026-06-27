@@ -26,6 +26,19 @@ class FakeHermes:
         yield (None, "ok", "stop")
 
 
+class FakeHexRunner:
+    def __init__(self):
+        self.targets = []
+
+    def validate_target(self, target):
+        return target
+
+    async def stream_recon(self, target):
+        self.targets.append(target.target)
+        yield "started"
+        yield "done"
+
+
 class BridgeG2ProtocolTests(unittest.IsolatedAsyncioTestCase):
     async def test_surface_get_returns_semantic_items(self):
         ws = FakeWs()
@@ -127,6 +140,8 @@ class BridgeG2ProtocolTests(unittest.IsolatedAsyncioTestCase):
         ws = FakeWs()
         hermes = FakeHermes()
         conn = BridgeConnection(ws, hermes, "test")
+        runner = FakeHexRunner()
+        conn.hex_runner = runner
 
         await conn._handle_request({
             "method": "g2.target.set",
@@ -151,13 +166,15 @@ class BridgeG2ProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(once_response["payload"]["state"], "running")
         self.assertEqual(once_response["payload"]["accepted"], True)
         await asyncio.sleep(0)
-        self.assertTrue(any("hexstrike-kali-htb" in message for message in hermes.messages))
-        self.assertTrue(any("10.129.22.74" in message for message in hermes.messages))
+        self.assertEqual(hermes.messages, [])
+        self.assertEqual(runner.targets, ["10.129.22.74"])
 
     async def test_session_grant_skips_second_recon_approval(self):
         ws = FakeWs()
         hermes = FakeHermes()
         conn = BridgeConnection(ws, hermes, "test")
+        runner = FakeHexRunner()
+        conn.hex_runner = runner
 
         await conn._handle_request({
             "method": "g2.target.set",
@@ -178,7 +195,23 @@ class BridgeG2ProtocolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["payload"]["state"], "running")
         self.assertNotIn("approval", response["payload"])
         await asyncio.sleep(0)
-        self.assertGreaterEqual(len(hermes.messages), 2)
+        self.assertEqual(hermes.messages, [])
+        self.assertEqual(runner.targets, ["10.129.22.74", "10.129.22.74"])
+
+    async def test_recon_action_rejects_public_cidr_before_approval(self):
+        ws = FakeWs()
+        conn = BridgeConnection(ws, FakeHermes(), "test")
+
+        await conn._handle_request({
+            "method": "g2.target.set",
+            "params": {"target": "192.169.1.0 \\24", "scope": "lab"},
+        }, "target-set")
+        await conn._handle_request({"method": "g2.action.run", "params": {"id": "hex_recon"}}, "recon")
+
+        response = ws.sent[-1]
+        self.assertEqual(response["ok"], False)
+        self.assertEqual(response["error"]["code"], 400)
+        self.assertIn("outside allowed", response["error"]["message"])
 
 
 if __name__ == "__main__":

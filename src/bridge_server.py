@@ -41,6 +41,7 @@ except ImportError:
     raise SystemExit("aiohttp is required: pip install aiohttp")
 
 from .g2_approval import ApprovalManager, TargetContext
+from .g2_hexstrike import HexStrikeRunner, HexStrikeTargetError, normalize_target
 from .g2_surface import build_default_surface, find_surface_item, prompt_for_action
 
 logger = logging.getLogger("hermes-glass")
@@ -291,6 +292,7 @@ class BridgeConnection:
         self.subscribed: Set[str] = set()
         self.target = TargetContext()
         self.approvals = ApprovalManager()
+        self.hex_runner = HexStrikeRunner()
 
     async def handle(self):
         """Main read loop for aiohttp WebSocketResponse."""
@@ -499,7 +501,7 @@ class BridgeConnection:
     async def _handle_g2_target_set(self, msg_id: str, params: dict):
         raw_target = params.get("target", "")
         raw_scope = params.get("scope", "")
-        target = raw_target.strip() if isinstance(raw_target, str) else ""
+        target = normalize_target(raw_target) if isinstance(raw_target, str) else ""
         scope = raw_scope.strip() if isinstance(raw_scope, str) else ""
         if len(target) > 128 or len(scope) > 240:
             await self.ws.send_str(make_error(msg_id, 400, "target or scope is too long"))
@@ -512,6 +514,14 @@ class BridgeConnection:
         if not target:
             await self.ws.send_str(make_error(msg_id, 400, "HexStrike target is required"))
             return
+        try:
+            normalized_target = self.hex_runner.validate_target(target)
+        except HexStrikeTargetError as exc:
+            await self.ws.send_str(make_error(msg_id, 400, str(exc)))
+            return
+        if normalized_target != target:
+            self.target = TargetContext(target=normalized_target, scope=self.target.scope)
+            target = normalized_target
 
         session_key = params.get("sessionKey", self.agent_id)
         if not isinstance(session_key, str) or not session_key.strip():
@@ -526,7 +536,7 @@ class BridgeConnection:
                 "sessionKey": session_key,
                 "grant": "session",
             }))
-            asyncio.create_task(self._handle_chat(session_key, prompt))
+            asyncio.create_task(self._handle_hex_recon(session_key, self.target))
             return
 
         approval = self.approvals.create_recon_approval(self.target, prompt=prompt)
@@ -560,6 +570,11 @@ class BridgeConnection:
             return
 
         prompt = result.pop("prompt", None)
+        workflow = result.pop("workflow", "")
+        approved_target = TargetContext(
+            target=str(result.pop("target", "") or self.target.target),
+            scope=str(result.pop("scope", "") or self.target.scope),
+        )
         session_key = params.get("sessionKey", self.agent_id)
         if not isinstance(session_key, str) or not session_key.strip():
             session_key = self.agent_id
@@ -567,7 +582,9 @@ class BridgeConnection:
             result["sessionKey"] = session_key
 
         await self.ws.send_str(make_response(msg_id, result))
-        if isinstance(prompt, str) and prompt:
+        if result.get("state") == "running" and workflow == "hexstrike-recon":
+            asyncio.create_task(self._handle_hex_recon(session_key, approved_target))
+        elif isinstance(prompt, str) and prompt:
             asyncio.create_task(self._handle_chat(session_key, prompt))
 
     async def _handle_audio_transcribe(self, msg_id: str, params: dict):
@@ -655,6 +672,57 @@ class BridgeConnection:
             "result": accumulated, "timestamp": int(time.time() * 1000),
         }))
         logger.info("Chat done %s (run %s, %d chars)", self.conn_id, run_id[:8], len(accumulated))
+
+    async def _handle_hex_recon(self, session_key: str, target: TargetContext):
+        """Run the bounded HexStrike worker and stream concise status to G2."""
+        run_id = str(uuid.uuid4())
+        ts = int(time.time() * 1000)
+        await self.ws.send_str(make_event("agent.event", {
+            "runId": run_id, "seq": 0, "stream": self.agent_id,
+            "ts": ts, "data": {"sessionKey": session_key, "status": "busy"},
+        }))
+
+        accumulated = ""
+        seq = 0
+        status = "ok"
+        try:
+            async for line in self.hex_runner.stream_recon(target):
+                clean = str(line).strip()
+                if not clean:
+                    continue
+                accumulated = (accumulated + "\n" + clean).strip()[-1800:]
+                seq += 1
+                await self.ws.send_str(make_event("chat.event", {
+                    "runId": run_id, "sessionKey": session_key,
+                    "seq": seq, "state": "delta",
+                    "message": {"role": "assistant", "content": accumulated},
+                }))
+        except Exception as exc:
+            status = "error"
+            accumulated = f"HexStrike recon failed: {exc}"
+            logger.exception("HexStrike recon failed for %s", target.target)
+
+        if not accumulated:
+            accumulated = "HexStrike recon finished without output."
+
+        seq += 1
+        await self.ws.send_str(make_event("chat.event", {
+            "runId": run_id, "sessionKey": session_key,
+            "seq": seq, "state": "final",
+            "message": {"role": "assistant", "content": accumulated},
+            "stopReason": "stop" if status == "ok" else "error",
+        }))
+        await self.ws.send_str(make_event("agent.event", {
+            "runId": run_id, "seq": seq + 1, "stream": self.agent_id,
+            "ts": int(time.time() * 1000),
+            "data": {"sessionKey": session_key, "status": "idle"},
+        }))
+        await self.ws.send_str(make_event("agent.completion", {
+            "agentId": self.agent_id, "sessionKey": session_key,
+            "runId": run_id, "status": status,
+            "result": accumulated, "timestamp": int(time.time() * 1000),
+        }))
+        logger.info("HexStrike recon done %s (run %s, status=%s)", self.conn_id, run_id[:8], status)
 
 # ─── Unified aiohttp server (HTTP + WebSocket on same port) ─────
 # This is critical for Tailscale serve: it does HTTPS->HTTP reverse proxy
