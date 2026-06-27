@@ -46,6 +46,13 @@ Example response:
     "models": true,
     "tts": false
   },
+  "reports": {
+    "current": {
+      "label": "Current engagement report",
+      "url": "https://titagram.tail005130.ts.net:8899/engagements/current/",
+      "source": "bridge"
+    }
+  },
   "models": {
     "llm": {
       "current": "gemma4:local",
@@ -83,6 +90,11 @@ The important rule is that model families expose both:
 - `current`: the currently selected/effective model;
 - `available`: all models discovered from the relevant source, including the
   current model when it is known.
+
+The `reports.current.url` field points to the current engagement report page
+exposed by the bridge environment, typically through Tailscale. The phone app
+renders it as an external link. The URL must come from bridge configuration or
+server-side state, not from a hard-coded phone client constant.
 
 ## Model Discovery
 
@@ -159,6 +171,7 @@ The phone-side configuration screen should default to collapsed sections:
 3. `Target`
    - HexStrike target
    - HexStrike scope
+   - Report page link
 
 4. `Models`
    - Hermes LLM model
@@ -180,6 +193,12 @@ panel instead of creating inline help text under each input.
 Model fields should prefer dropdowns populated from `g2.info.models.*.available`.
 Free text remains an advanced fallback only when the server cannot expose a
 model list.
+
+The `Target` section should include an `Open Reports` link when
+`g2.info.reports.current.url` is present. It opens the Tailscale report page
+for the current engagement, for example the existing
+`https://titagram.tail005130.ts.net:8899/engagements/current/` endpoint. If the
+bridge does not report a URL, the link is hidden.
 
 ## G2 Overlay UX Direction
 
@@ -245,6 +264,7 @@ App tests:
 - mobile sections render closed by default;
 - tooltip panel remains outside the collapsed sections and updates from `?`;
 - model dropdowns use `g2.info.models.*.available`;
+- report link renders only when `g2.info.reports.current.url` is present;
 - old bridge fallback preserves existing manual STT field behavior;
 - G2 model picker formats rows under firmware list limits.
 
