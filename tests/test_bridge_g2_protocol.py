@@ -1,9 +1,10 @@
 import json
 import asyncio
 import os
+import tempfile
 import unittest
 
-from src.bridge_server import BridgeConnection
+from src.bridge_server import BridgeConnection, HermesClient, _extract_model_ids
 from src.g2_jobs import G2JobManager
 from src.g2_state import G2StateStore
 
@@ -25,6 +26,7 @@ class FakeHermes:
 
     def __init__(self):
         self.messages = []
+        self.switched_models = []
 
     async def chat_stream(self, message, session_id=None):
         self.messages.append(message)
@@ -32,6 +34,10 @@ class FakeHermes:
 
     async def list_models(self):
         return list(self.available_models), "/models"
+
+    async def set_model(self, model_id):
+        self.switched_models.append(model_id)
+        self.model = model_id
 
 
 class FakeHexRunner:
@@ -68,6 +74,66 @@ class BridgeG2ProtocolTests(unittest.IsolatedAsyncioTestCase):
                 os.environ["HEXSTRIKE_HEALTH_URL"] = old_health_url
 
         self.addCleanup(restore_health_url)
+
+    def test_extract_model_ids_supports_ollama_tags(self):
+        models = _extract_model_ids({
+            "models": [
+                {"name": "gemma4:latest"},
+                {"model": "qwen3.6:latest"},
+                {"id": "hermes-agent"},
+                {"name": "gemma4:latest"},
+            ],
+        })
+
+        self.assertEqual(models, ["gemma4:latest", "qwen3.6:latest", "hermes-agent"])
+
+    async def test_hermes_client_set_model_updates_gateway_config(self):
+        calls = []
+
+        async def fake_runner(args):
+            calls.append(args)
+
+        hermes = HermesClient(
+            "http://127.0.0.1:8642",
+            "",
+            model="hermes-agent",
+            model_switch_config_command=("hermes", "config", "set"),
+            model_switch_restart_command=("systemctl", "--user", "restart", "hermes-gateway.service"),
+            command_runner=fake_runner,
+        )
+
+        await hermes.set_model("gemma4:latest")
+
+        self.assertEqual(calls, [
+            ["hermes", "config", "set", "model.default", "gemma4:latest"],
+            ["hermes", "config", "set", "model.provider", "custom:Local Ollama"],
+            ["hermes", "config", "set", "model.base_url", "http://127.0.0.1:11434/v1"],
+            ["hermes", "config", "set", "model.api_mode", "chat_completions"],
+            ["hermes", "config", "set", "model.api_key", "ollama"],
+            ["systemctl", "--user", "restart", "hermes-gateway.service"],
+        ])
+        self.assertEqual(hermes.model, "gemma4:latest")
+
+    def test_hermes_client_current_model_reads_gateway_config(self):
+        with tempfile.NamedTemporaryFile("w", delete=False) as handle:
+            handle.write(
+                "model:\n"
+                "  default: gpt-5.5\n"
+                "  provider: openai-codex\n"
+                "  base_url: https://chatgpt.com/backend-api/codex\n"
+            )
+            config_path = handle.name
+        self.addCleanup(lambda: os.path.exists(config_path) and os.unlink(config_path))
+
+        hermes = HermesClient(
+            "http://127.0.0.1:8642",
+            "",
+            model="hermes-agent",
+            model_config_path=config_path,
+            model_switch_config_command=(),
+        )
+
+        self.assertEqual(hermes.current_model(), "gpt-5.5")
 
     def stateful_conn(self, store, runner=None):
         ws = FakeWs()
@@ -136,8 +202,26 @@ class BridgeG2ProtocolTests(unittest.IsolatedAsyncioTestCase):
 
         response = ws.sent[-1]
         self.assertEqual(response["ok"], True)
+        self.assertEqual(hermes.switched_models, ["qwen-coder"])
         self.assertEqual(hermes.model, "qwen-coder")
         self.assertEqual(response["payload"]["models"]["llm"]["current"], "qwen-coder")
+
+    async def test_g2_models_set_current_model_is_noop_when_not_discovered(self):
+        ws = FakeWs()
+        hermes = FakeHermes()
+        hermes.available_models = ["gemma4:local", "qwen-coder"]
+        hermes.model = "gpt-5.5"
+        conn = BridgeConnection(ws, hermes, "test")
+
+        await conn._handle_request({
+            "method": "g2.models.set",
+            "params": {"family": "llm", "modelId": "gpt-5.5"},
+        }, "model-set-current")
+
+        response = ws.sent[-1]
+        self.assertEqual(response["ok"], True)
+        self.assertEqual(hermes.switched_models, [])
+        self.assertEqual(response["payload"]["models"]["llm"]["current"], "gpt-5.5")
 
     async def test_g2_models_set_rejects_unknown_model(self):
         ws = FakeWs()

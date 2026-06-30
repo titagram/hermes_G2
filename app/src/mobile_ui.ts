@@ -1,4 +1,4 @@
-export const APP_RELEASE_LABEL = 'v1.0.5 cyber'
+export const APP_RELEASE_LABEL = 'v1.0.6 cyber'
 
 export const CONFIG_HELP_TEXT = {
   profiles: 'Connection profiles keep URL, token, session cursor and recovery state separate for each Hermes instance.',

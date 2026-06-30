@@ -16,8 +16,8 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 const manifest = JSON.parse(readFileSync(join(__dirname, '..', 'app.json'), 'utf8'))
 
 test('mobile UI release label matches Even Hub manifest version', () => {
-  assert.equal(manifest.version, '1.0.5')
-  assert.equal(APP_RELEASE_LABEL, 'v1.0.5 cyber')
+  assert.equal(manifest.version, '1.0.6')
+  assert.equal(APP_RELEASE_LABEL, 'v1.0.6 cyber')
 })
 
 test('mobile UI explains ambiguous configuration fields', () => {

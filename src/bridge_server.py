@@ -22,12 +22,13 @@ import binascii
 import json
 import logging
 import os
+import shlex
 import signal
 import tempfile
 import threading
 import time
 import uuid
-from typing import Any, Dict, Optional, Set
+from typing import Any, Awaitable, Callable, Dict, Optional, Sequence, Set
 
 try:
     import websockets
@@ -52,6 +53,7 @@ logger = logging.getLogger("hermes-glass")
 DEFAULT_WS_HOST = "0.0.0.0"
 DEFAULT_WS_PORT = 18790
 DEFAULT_HERMES_URL = "http://127.0.0.1:8642"
+DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 DEFAULT_STT_PROVIDER = "auto"
 DEFAULT_LOCAL_STT_MODEL = "tiny"
 DEFAULT_LOCAL_STT_DEVICE = "cpu"
@@ -60,6 +62,10 @@ PROTOCOL_VERSION = 3
 BRIDGE_VERSION = "1.0.5"
 DEFAULT_REPORT_URL = "https://titagram.tail005130.ts.net:8899/engagements/current/"
 DEFAULT_LOCAL_STT_MODELS = ("tiny", "base", "small", "medium", "large-v3")
+DEFAULT_MODEL_SWITCH_PROVIDER = "custom:Local Ollama"
+DEFAULT_MODEL_SWITCH_BASE_URL = f"{DEFAULT_OLLAMA_URL}/v1"
+DEFAULT_MODEL_SWITCH_API_MODE = "chat_completions"
+DEFAULT_MODEL_SWITCH_API_KEY = "ollama"
 DELTA_THRESHOLD = 40  # chars before a delta flush
 
 # ─── protocol helpers ────────────────────────────────────────────
@@ -90,12 +96,19 @@ def _extract_model_ids(data: Any) -> list[str]:
 
     ids: list[str] = []
     for item in raw_items:
-        model_id = item.get("id") if isinstance(item, dict) else item
+        model_id = item
+        if isinstance(item, dict):
+            model_id = item.get("id") or item.get("name") or item.get("model")
         if isinstance(model_id, str) and model_id.strip():
             cleaned = model_id.strip()
             if cleaned not in ids:
                 ids.append(cleaned)
     return ids
+
+def _command_from_env(value: Optional[str]) -> tuple[str, ...]:
+    if not value or not value.strip():
+        return ()
+    return tuple(shlex.split(value))
 
 # ─── Hermes API client ───────────────────────────────────────────
 
@@ -122,11 +135,29 @@ class HermesClient:
         local_stt_device: str = DEFAULT_LOCAL_STT_DEVICE,
         local_stt_compute_type: str = DEFAULT_LOCAL_STT_COMPUTE_TYPE,
         local_stt_language: Optional[str] = None,
+        ollama_url: str = DEFAULT_OLLAMA_URL,
+        model_switch_config_command: Sequence[str] = ("hermes", "config", "set"),
+        model_switch_restart_command: Sequence[str] = (),
+        model_switch_provider: str = DEFAULT_MODEL_SWITCH_PROVIDER,
+        model_switch_base_url: str = DEFAULT_MODEL_SWITCH_BASE_URL,
+        model_switch_api_mode: str = DEFAULT_MODEL_SWITCH_API_MODE,
+        model_switch_api_key: str = DEFAULT_MODEL_SWITCH_API_KEY,
+        model_config_path: Optional[str] = None,
+        command_runner: Optional[Callable[[list[str]], Awaitable[None]]] = None,
     ):
         self.base_url = base_url.rstrip("/")
+        self.ollama_url = ollama_url.rstrip("/")
         self.api_key = api_key
         self.model = model
         self.stt_model = stt_model
+        self.model_switch_config_command = tuple(model_switch_config_command)
+        self.model_switch_restart_command = tuple(model_switch_restart_command)
+        self.model_switch_provider = model_switch_provider
+        self.model_switch_base_url = model_switch_base_url
+        self.model_switch_api_mode = model_switch_api_mode
+        self.model_switch_api_key = model_switch_api_key
+        self.model_config_path = os.path.expanduser(model_config_path or "~/.hermes/config.yaml")
+        self._command_runner = command_runner
         provider = stt_provider.strip().lower()
         if provider not in {"auto", "hermes", "local"}:
             raise ValueError("stt_provider must be one of: auto, hermes, local")
@@ -150,6 +181,14 @@ class HermesClient:
 
     async def list_models(self) -> tuple[list[str], str]:
         """Return available Hermes LLM models and the endpoint that provided them."""
+        try:
+            ollama_models = await self._fetch_ollama_models()
+        except Exception as exc:
+            logger.debug("Ollama model discovery failed: %s", exc)
+        else:
+            if ollama_models:
+                return ollama_models, "ollama:/api/tags"
+
         for path in ("/models", "/v1/models"):
             try:
                 models = await self._fetch_models(path)
@@ -160,6 +199,14 @@ class HermesClient:
                 return models, path
         return [], "configured"
 
+    async def _fetch_ollama_models(self) -> list[str]:
+        session = await self._get_session()
+        async with session.get(f"{self.ollama_url}/api/tags") as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"Ollama /api/tags returned {resp.status}")
+            data = await resp.json()
+        return _extract_model_ids(data)
+
     async def _fetch_models(self, path: str) -> list[str]:
         session = await self._get_session()
         async with session.get(f"{self.base_url}{path}") as resp:
@@ -167,6 +214,73 @@ class HermesClient:
                 raise RuntimeError(f"{path} returned {resp.status}")
             data = await resp.json()
         return _extract_model_ids(data)
+
+    async def set_model(self, model_id: str) -> None:
+        requested = model_id.strip()
+        if not requested:
+            raise ValueError("model id is required")
+
+        if self.model_switch_config_command:
+            updates = [
+                ("model.default", requested),
+                ("model.provider", self.model_switch_provider),
+                ("model.base_url", self.model_switch_base_url),
+                ("model.api_mode", self.model_switch_api_mode),
+                ("model.api_key", self.model_switch_api_key),
+            ]
+            for key, value in updates:
+                if value:
+                    await self._run_command([*self.model_switch_config_command, key, value])
+
+        if self.model_switch_restart_command:
+            await self._run_command(list(self.model_switch_restart_command))
+
+        self.model = requested
+
+    def current_model(self) -> str:
+        return self._read_model_from_config() or self.model
+
+    def _read_model_from_config(self) -> Optional[str]:
+        if not self.model_config_path or not os.path.exists(self.model_config_path):
+            return None
+
+        in_model_block = False
+        model_indent = 0
+        try:
+            with open(self.model_config_path, encoding="utf-8") as handle:
+                for raw_line in handle:
+                    line = raw_line.split("#", 1)[0].rstrip()
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    indent = len(line) - len(line.lstrip(" "))
+                    if stripped == "model:":
+                        in_model_block = True
+                        model_indent = indent
+                        continue
+                    if in_model_block and indent <= model_indent:
+                        break
+                    if in_model_block and stripped.startswith("default:"):
+                        value = stripped.split(":", 1)[1].strip().strip("\"'")
+                        return value or None
+        except OSError as exc:
+            logger.debug("Unable to read Hermes config model: %s", exc)
+        return None
+
+    async def _run_command(self, args: list[str]) -> None:
+        if self._command_runner is not None:
+            await self._command_runner(args)
+            return
+
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            output = (stderr or stdout).decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"{args[0]} failed with exit code {proc.returncode}: {output}")
 
     async def chat_stream(self, message: str, session_id: Optional[str] = None):
         """POST /v1/chat/completions with stream=True. Yields (delta, final, finish_reason)."""
@@ -561,7 +675,7 @@ class BridgeConnection:
             target=self.target,
             pending_approvals=self.approvals.pending(),
             active_jobs=active_jobs,
-            model=self.hermes.model,
+            model=self._current_model(),
         )
 
     async def _handle_g2_info(self, msg_id: str):
@@ -569,7 +683,7 @@ class BridgeConnection:
 
     async def _build_info(self) -> dict[str, Any]:
         llm_models, llm_source = await self.hermes.list_models()
-        current_llm = self.hermes.model
+        current_llm = self._current_model()
         stt_current = self.hermes.local_stt_model if self.hermes.stt_provider == "local" else self.hermes.stt_model
         report_url = os.getenv("HERMES_G2_REPORT_URL", DEFAULT_REPORT_URL).strip()
         reports = {
@@ -631,6 +745,12 @@ class BridgeConnection:
             for model_id in ids
         ]
 
+    def _current_model(self) -> str:
+        current_model = getattr(self.hermes, "current_model", None)
+        if callable(current_model):
+            return current_model()
+        return self.hermes.model
+
     async def _handle_g2_models_set(self, msg_id: str, params: dict):
         family = params.get("family")
         model_id = params.get("modelId")
@@ -642,12 +762,21 @@ class BridgeConnection:
             return
 
         requested = model_id.strip()
+        current = self._current_model()
         models, _ = await self.hermes.list_models()
-        if requested not in models and requested != self.hermes.model:
+        if requested not in models and requested != current:
             await self.ws.send_str(make_error(msg_id, 404, f"unknown model: {requested}"))
             return
+        if requested == current:
+            await self.ws.send_str(make_response(msg_id, await self._build_info()))
+            return
 
-        self.hermes.model = requested
+        try:
+            await self.hermes.set_model(requested)
+        except Exception as exc:
+            logger.error("Hermes model switch failed: %s", exc)
+            await self.ws.send_str(make_error(msg_id, 502, f"model switch failed: {exc}"))
+            return
         await self.ws.send_str(make_response(msg_id, await self._build_info()))
 
     def _target_payload(self) -> dict:
@@ -1076,6 +1205,14 @@ def create_app(
     local_stt_device: str,
     local_stt_compute_type: str,
     local_stt_language: Optional[str],
+    ollama_url: str = DEFAULT_OLLAMA_URL,
+    model_switch_config_command: Sequence[str] = ("hermes", "config", "set"),
+    model_switch_restart_command: Sequence[str] = (),
+    model_switch_provider: str = DEFAULT_MODEL_SWITCH_PROVIDER,
+    model_switch_base_url: str = DEFAULT_MODEL_SWITCH_BASE_URL,
+    model_switch_api_mode: str = DEFAULT_MODEL_SWITCH_API_MODE,
+    model_switch_api_key: str = DEFAULT_MODEL_SWITCH_API_KEY,
+    model_config_path: Optional[str] = None,
 ) -> web.Application:
     app = web.Application()
     app["hermes_client"] = HermesClient(
@@ -1088,6 +1225,14 @@ def create_app(
         local_stt_device=local_stt_device,
         local_stt_compute_type=local_stt_compute_type,
         local_stt_language=local_stt_language,
+        ollama_url=ollama_url,
+        model_switch_config_command=model_switch_config_command,
+        model_switch_restart_command=model_switch_restart_command,
+        model_switch_provider=model_switch_provider,
+        model_switch_base_url=model_switch_base_url,
+        model_switch_api_mode=model_switch_api_mode,
+        model_switch_api_key=model_switch_api_key,
+        model_config_path=model_config_path,
     )
     app["g2_state_store"] = G2StateStore()
     app["g2_job_manager"] = G2JobManager(app["g2_state_store"])
@@ -1110,6 +1255,14 @@ async def main_async(args):
         args.local_stt_device,
         args.local_stt_compute_type,
         args.local_stt_language,
+        args.ollama_url,
+        args.model_switch_config_command,
+        args.model_switch_restart_command,
+        args.model_switch_provider,
+        args.model_switch_base_url,
+        args.model_switch_api_mode,
+        args.model_switch_api_key,
+        args.model_config_path,
     )
 
     # Also keep the old health on port+1 for backwards compat
@@ -1154,8 +1307,28 @@ def main():
     parser.add_argument("--local-stt-compute-type",
                         default=os.getenv("HERMES_LOCAL_STT_COMPUTE_TYPE", DEFAULT_LOCAL_STT_COMPUTE_TYPE))
     parser.add_argument("--local-stt-language", default=os.getenv("HERMES_LOCAL_STT_LANGUAGE") or None)
+    parser.add_argument("--ollama-url", default=os.getenv("HERMES_OLLAMA_URL", DEFAULT_OLLAMA_URL))
+    parser.add_argument(
+        "--model-switch-config-command",
+        default=os.getenv("HERMES_MODEL_SWITCH_CONFIG_COMMAND", "hermes config set"),
+    )
+    parser.add_argument(
+        "--model-switch-restart-command",
+        default=os.getenv("HERMES_MODEL_SWITCH_RESTART_COMMAND", ""),
+    )
+    parser.add_argument("--model-switch-provider",
+                        default=os.getenv("HERMES_MODEL_SWITCH_PROVIDER", DEFAULT_MODEL_SWITCH_PROVIDER))
+    parser.add_argument("--model-switch-base-url",
+                        default=os.getenv("HERMES_MODEL_SWITCH_BASE_URL", DEFAULT_MODEL_SWITCH_BASE_URL))
+    parser.add_argument("--model-switch-api-mode",
+                        default=os.getenv("HERMES_MODEL_SWITCH_API_MODE", DEFAULT_MODEL_SWITCH_API_MODE))
+    parser.add_argument("--model-switch-api-key",
+                        default=os.getenv("HERMES_MODEL_SWITCH_API_KEY", DEFAULT_MODEL_SWITCH_API_KEY))
+    parser.add_argument("--model-config-path", default=os.getenv("HERMES_CONFIG_PATH") or None)
     parser.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"))
     args = parser.parse_args()
+    args.model_switch_config_command = _command_from_env(args.model_switch_config_command)
+    args.model_switch_restart_command = _command_from_env(args.model_switch_restart_command)
 
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),

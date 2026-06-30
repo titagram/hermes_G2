@@ -58,11 +58,19 @@ import {
   normalizeG2Info,
 } from './g2_info'
 import {
+  DASHBOARD_DIMENSIONS,
+  buildApprovalDecisionText,
+  buildDashboardFallbackText,
+  buildDashboardView,
+  buildStatusPageText,
+  buildVoiceStatusText,
+  cleanForG2,
+} from './g2_display'
+import {
   type G2Approval,
   type G2Surface,
   type SurfaceItem,
   formatApprovalOptionRow,
-  formatHomeRow,
   normalizeApproval,
   normalizeSurface,
   paginateDetail,
@@ -77,6 +85,11 @@ const BODY_H = 240
 const BODY_PAD = 6
 const STATUS_H = 28
 const STATUS_Y = BODY_H + 4
+const DASH_HEADER_H = DASHBOARD_DIMENSIONS.headerHeight
+const DASH_LIST_Y = DASHBOARD_DIMENSIONS.listY
+const DASH_LIST_H = DASHBOARD_DIMENSIONS.listHeight
+const DASH_HINT_Y = DASHBOARD_DIMENSIONS.hintY
+const DASH_HINT_H = DASHBOARD_DIMENSIONS.hintHeight
 
 const CHARS_PER_PAGE = 220
 const ENV_BRIDGE_URL = import.meta.env.VITE_BRIDGE_URL?.trim()
@@ -586,10 +599,10 @@ class HermesBridgeClient {
   private sendHandshake() {
     this.send({ type: 'req', id: this.genId(), method: 'connect', params: {
       minProtocol: 3, maxProtocol: 3,
-      client: { id: 'hermes-glass', version: '1.0.0', platform: 'web', mode: 'operator' },
+      client: { id: 'hermes-glass', version: '1.0.6', platform: 'web', mode: 'operator' },
       role: 'operator', scopes: ['operator.read', 'operator.write'],
       token: this.token,
-      caps: [], commands: [], permissions: {}, locale: 'en-US', userAgent: 'hermes-glass/1.0.0',
+      caps: [], commands: [], permissions: {}, locale: 'en-US', userAgent: 'hermes-glass/1.0.6',
     }})
   }
 
@@ -742,12 +755,6 @@ class HermesBridgeClient {
 
 // ── Text utilities ───────────────────────────────────────────────
 
-function cleanForG2(text: string): string {
-  return text.replace(/```[\s\S]*?```/g, '[code]').replace(/`([^`]+)`/g, '$1')
-    .replace(/\*\*([^*]+)\*\*/g, '$1').replace(/\*([^*]+)\*/g, '$1')
-    .replace(/https?:\/\/\S+/gi, '[link]').replace(/\[([^\]]+)\]\([^)]+\)/g, '$1').trim()
-}
-
 function paginate(text: string): string[] {
   if (text.length <= CHARS_PER_PAGE) return [text]
   const paras = text.split(/\n{2,}/).map(p => p.trim()).filter(Boolean)
@@ -848,24 +855,11 @@ async function updateStatus(content: string) {
 }
 
 function buildHomeText(surface: G2Surface): string {
-  if (surface.items.length === 0) return 'Hermes\n\nNo actions available.'
-  return surface.items
-    .map((item, index) => `${index === selectedHomeIndex ? '>' : ' '} ${formatHomeRow(item)}`)
-    .join('\n')
+  return buildDashboardFallbackText(buildDashboardView(surface, selectedHomeIndex), selectedHomeIndex)
 }
 
 function buildApprovalText(approval: G2Approval): string {
-  const lines = [
-    'APPROVAL',
-    approval.title,
-    approval.target || 'target not set',
-    `risk ${approval.risk}`,
-    '',
-    ...approval.options.map((option, index) => (
-      `${index === selectedApprovalOptionIndex ? '>' : ' '} ${formatApprovalOptionRow(option)}`
-    )),
-  ]
-  return lines.join('\n')
+  return buildApprovalDecisionText(approval, selectedApprovalOptionIndex)
 }
 
 function buildModelPickerText(): string {
@@ -915,14 +909,14 @@ async function renderHomeSurface(surface: G2Surface) {
   setWebConnectionStatus(`Connected to ${activeProfile(appConfig).name}`)
   setWebConnected(true)
 
-  const rows = surface.items.map((item) => formatHomeRow(item))
-  const status = `${surface.status.agent} | press: select | double: exit`
-  currentStatusContent = status
-  setWebPreview(buildHomeText(surface))
-  setWebDisplayStatus(status)
+  const view = buildDashboardView(surface, selectedHomeIndex)
+  const fallbackText = buildDashboardFallbackText(view, selectedHomeIndex)
+  currentStatusContent = view.hint
+  setWebPreview(fallbackText)
+  setWebDisplayStatus(view.hint)
 
-  if (rows.length === 0) {
-    await rebuildTextLayout('Hermes\n\nNo actions available.', status)
+  if (view.rows.length === 0) {
+    await rebuildTextLayout(buildStatusPageText('Hermes', ['No actions available.']), view.hint)
     return
   }
 
@@ -930,32 +924,41 @@ async function renderHomeSurface(surface: G2Surface) {
     await enqueueBridgeCall(async () => {
       const b = await bridge()
       await b.rebuildPageContainer(new RebuildPageContainer({
-        containerTotalNum: 2,
+        containerTotalNum: 3,
         listObject: [new ListContainerProperty({
-          xPosition: 0, yPosition: 0, width: DISPLAY_W, height: BODY_H,
-          borderWidth: 0, borderColor: 5, paddingLength: BODY_PAD,
-          containerID: 1, containerName: 'home',
+          xPosition: 0, yPosition: DASH_LIST_Y, width: DISPLAY_W, height: DASH_LIST_H,
+          borderWidth: 0, borderColor: 5, paddingLength: 4,
+          containerID: 1, containerName: 'g2List',
           itemContainer: new ListItemContainerProperty({
-            itemCount: rows.length,
+            itemCount: view.rows.length,
             itemWidth: 0,
             isItemSelectBorderEn: 1,
-            itemName: rows,
+            itemName: view.rows,
           }),
           isEventCapture: 1,
         })],
-        textObject: [new TextContainerProperty({
-          xPosition: 0, yPosition: STATUS_Y, width: DISPLAY_W, height: STATUS_H,
-          borderWidth: 0, borderColor: 5, paddingLength: 4,
-          containerID: 2, containerName: 'status',
-          content: status,
-          isEventCapture: 0,
-        })],
+        textObject: [
+          new TextContainerProperty({
+            xPosition: 0, yPosition: 0, width: DISPLAY_W, height: DASH_HEADER_H,
+            borderWidth: 0, borderColor: 5, paddingLength: 4,
+            containerID: 2, containerName: 'g2Header',
+            content: view.header,
+            isEventCapture: 0,
+          }),
+          new TextContainerProperty({
+            xPosition: 0, yPosition: DASH_HINT_Y, width: DISPLAY_W, height: DASH_HINT_H,
+            borderWidth: 0, borderColor: 5, paddingLength: 4,
+            containerID: 3, containerName: 'g2Hint',
+            content: view.hint,
+            isEventCapture: 0,
+          }),
+        ],
       }))
     })
     glassesLayout = 'list'
   } catch (err) {
     console.warn('[HG] Native list render failed, using text fallback:', err)
-    await rebuildTextLayout(buildHomeText(surface), status)
+    await rebuildTextLayout(fallbackText, view.hint)
   }
 }
 
@@ -1025,7 +1028,12 @@ async function showConfigScreen() {
   setWebConfig(appConfig)
   setWebConnectionStatus('Ready to connect')
   await updateBody(
-    `HERMESGLASS SETUP\n\nConfigure on phone screen.\nBridge:\n${appConfig.bridgeUrl}\n\nTap/ring: connect | Double-tap: exit`
+    buildStatusPageText('HermesGlass Setup', [
+      'Configure on phone screen.',
+      `Bridge: ${appConfig.bridgeUrl}`,
+      'tap/ring connect',
+      'double exit',
+    ])
   )
   await updateStatus(`Config | ${appConfig.inputMode} | ${Math.round(appConfig.maxRecordingMs / 1000)}s`)
 }
@@ -1037,7 +1045,7 @@ async function showChatScreen() {
   setWebState('Connecting')
   setWebConnectionStatus(`Connecting to ${profile.name}`)
   setWebConnected(false)
-  await rebuildTextLayout('HermesGlass\n\nConnecting...', 'Connecting...')
+  await rebuildTextLayout(buildStatusPageText('Connecting', [profile.name, profile.url]), 'Connecting...')
   await updateStatus('Connecting...')
 
   bridgeClient?.disconnect()
@@ -1072,7 +1080,7 @@ async function showChatScreen() {
       await renderHomeSurface(surface)
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
-      await rebuildTextLayout(`HermesGlass\n\nConnected, but surface failed:\n${cleanForG2(msg)}`, 'Surface error')
+      await rebuildTextLayout(buildStatusPageText('Surface Error', ['Connected, but surface failed:', msg]), 'Surface error')
     }
   }
 
@@ -1081,7 +1089,7 @@ async function showChatScreen() {
     setWebState('Reconnecting')
     setWebConnectionStatus('Disconnected. Reconnecting...')
     setWebConnected(false)
-    await rebuildTextLayout('HermesGlass\n\nDisconnected.\nReconnecting...', 'Reconnecting...')
+    await rebuildTextLayout(buildStatusPageText('Reconnecting', ['Disconnected from bridge.', 'Recovering session...']), 'Reconnecting...')
     await updateStatus('Reconnecting...')
   }
 
@@ -1113,13 +1121,17 @@ async function showChatScreen() {
     setWebState('Error')
     setWebConnectionStatus(msg)
     setWebConnected(false)
-    await updateBody(`HermesGlass\n\nError: ${msg}`)
+    await updateBody(buildStatusPageText('Error', [msg]))
     await updateStatus('Error | tap: retry')
   }
 
   bridgeClient.connect().catch((err: Error) => {
     console.error('[HG] Initial connect failed:', err)
-    updateBody(`HermesGlass\n\nConnection failed.\nCheck bridge URL in settings.\nDouble-tap to exit.`).catch(() => {})
+    updateBody(buildStatusPageText('Connection Failed', [
+      err.message,
+      'Check bridge URL on phone.',
+      'double exit',
+    ])).catch(() => {})
     updateStatus('Error').catch(() => {})
   })
 }
@@ -1181,7 +1193,7 @@ async function testBridgeConfiguration() {
 
   setWebState('Testing')
   setWebConnectionStatus('Testing bridge...')
-  await updateBody(`HermesGlass\n\nTesting bridge:\n${profile.name}\n${profile.url}`)
+  await updateBody(buildStatusPageText('Testing Bridge', [profile.name, profile.url]))
   await updateStatus('Testing bridge...')
 
   const testClient = new HermesBridgeClient(profile.url, profile.token)
@@ -1191,19 +1203,19 @@ async function testBridgeConfiguration() {
     if (capabilities.audioTranscribe === true && capabilities.g2Surface === true) {
       setWebState('Ready')
       setWebConnectionStatus('Bridge connected. G2 surface and STT route available.')
-      await updateBody('HermesGlass\n\nBridge OK.\nG2 surface available.\nSave & Connect to start.')
+      await updateBody(buildStatusPageText('Bridge OK', ['G2 surface available.', 'Save and connect.']))
       await updateStatus('Bridge OK | G2 ready')
     } else {
       setWebState('Bridge Old')
       setWebConnectionStatus('Bridge connected, but G2 surface or audio.transcribe is not available.')
-      await updateBody('HermesGlass\n\nBridge connected, but G2 surface is not available.\nRestart the updated bridge server.')
+      await updateBody(buildStatusPageText('Bridge Old', ['G2 surface unavailable.', 'Restart updated bridge server.']))
       await updateStatus('Bridge old | update server')
     }
   } catch (err) {
     setWebState('Bridge Error')
     const msg = err instanceof Error ? err.message : String(err)
     setWebConnectionStatus(msg)
-    await updateBody(`HermesGlass\n\nBridge test failed:\n${cleanForG2(msg)}`)
+    await updateBody(buildStatusPageText('Bridge Test Failed', [msg]))
     await updateStatus('Bridge test failed')
   } finally {
     testClient.disconnect()
@@ -1216,7 +1228,7 @@ async function sendTestPrompt() {
   }
   chatState = 'thinking'
   setWebState('Thinking')
-  await updateBody('HermesGlass\n\nThinking...')
+  await updateBody(buildStatusPageText('Thinking', ['Sending test prompt...']))
   await updateStatus('Thinking...')
   bridgeClient.sendChat('Say hello in one short sentence.')
 }
@@ -1266,7 +1278,11 @@ async function showConfirmForItem(item: SurfaceItem) {
   screen = 'confirm'
   pendingConfirmItem = item
   await rebuildTextLayout(
-    `Confirm action\n\n${item.label}\n${item.summary}\n\nPress to run.\nDouble press to go back.`,
+    buildStatusPageText('Confirm', [
+      `${item.label} ${item.summary}`,
+      'press run',
+      'double back',
+    ]),
     'Confirm | press: run'
   )
 }
@@ -1278,7 +1294,7 @@ async function runSurfaceAction(item: SurfaceItem) {
   screen = 'chat'
   chatState = 'thinking'
   setWebState('Running')
-  await rebuildTextLayout(`${item.label}\n\nRunning...`, 'Running action...')
+  await rebuildTextLayout(buildStatusPageText('Running', [`${item.label} ${item.summary}`]), 'Running action...')
 
   try {
     const result = await bridgeClient.runAction(item.id)
@@ -1291,14 +1307,14 @@ async function runSurfaceAction(item: SurfaceItem) {
     } else if (result.state === 'voice') {
       await startVoiceRecording()
     } else if (result.accepted !== true) {
-      await rebuildTextLayout(`${item.label}\n\nAction returned without output.`, 'Action complete')
+      await rebuildTextLayout(buildStatusPageText('Action Complete', [`${item.label} returned without output.`]), 'Action complete')
       chatState = 'idle'
     }
   } catch (err) {
     chatState = 'idle'
     screen = 'error'
     const msg = err instanceof Error ? err.message : String(err)
-    await rebuildTextLayout(`Action failed:\n${cleanForG2(msg)}`, 'Error | double: back')
+    await rebuildTextLayout(buildStatusPageText('Action Failed', [msg]), 'Error | double: back')
   }
 }
 
@@ -1309,7 +1325,7 @@ async function chooseApprovalOption(index: number) {
 
   setWebState('Approval')
   await rebuildTextLayout(
-    `${currentApproval.title}\n\n${formatApprovalOptionRow(option)}...`,
+    buildStatusPageText('Approval', [currentApproval.title, `${formatApprovalOptionRow(option)}...`]),
     'Sending approval...'
   )
 
@@ -1320,7 +1336,7 @@ async function chooseApprovalOption(index: number) {
       return
     }
     if (result.state === 'denied') {
-      await rebuildTextLayout('Approval denied.\n\nDouble press to go back.', 'Denied | double: back')
+      await rebuildTextLayout(buildStatusPageText('Denied', ['Approval denied.', 'double back']), 'Denied | double: back')
       screen = 'error'
       return
     }
@@ -1328,15 +1344,15 @@ async function chooseApprovalOption(index: number) {
       screen = 'chat'
       chatState = 'thinking'
       setWebState('Running')
-      await rebuildTextLayout(`${currentApproval.title}\n\nRunning...`, 'Running approved action...')
+      await rebuildTextLayout(buildStatusPageText('Running', [currentApproval.title]), 'Running approved action...')
       return
     }
-    await rebuildTextLayout('Approval response returned without action.', 'Approval complete')
+    await rebuildTextLayout(buildStatusPageText('Approval Complete', ['Response returned without action.']), 'Approval complete')
   } catch (err) {
     screen = 'error'
     chatState = 'idle'
     const msg = err instanceof Error ? err.message : String(err)
-    await rebuildTextLayout(`Approval failed:\n${cleanForG2(msg)}`, 'Error | double: back')
+    await rebuildTextLayout(buildStatusPageText('Approval Failed', [msg]), 'Error | double: back')
   }
 }
 
@@ -1429,7 +1445,7 @@ async function startVoiceRecording() {
   screen = 'chat'
   chatState = 'listening'
   setWebState('Listening')
-  await updateBody('HermesGlass\n\nListening...\nTap ring or temple again to send.')
+  await updateBody(buildVoiceStatusText('listening', Math.round(appConfig.maxRecordingMs / 1000)))
   await updateStatus('Listening | tap/ring: send')
 
   clearRecordingTimer()
@@ -1452,7 +1468,7 @@ async function startVoiceRecording() {
           clearRecordingTimer()
           chatState = 'idle'
           setWebState('Connected')
-          await updateBodyIfGlassesReady('HermesGlass\n\nMicrophone did not open.\nTap ring or temple to try again.')
+          await updateBodyIfGlassesReady(buildVoiceStatusText('mic-error', Math.round(appConfig.maxRecordingMs / 1000)))
           await updateStatusIfGlassesReady('Mic error | tap/ring: retry')
         }
       })
@@ -1474,14 +1490,14 @@ async function stopVoiceRecordingAndSend() {
   if (pcm.byteLength < 1600) {
     chatState = 'idle'
     setWebState('Connected')
-    await updateBodyIfGlassesReady('HermesGlass\n\nNo voice captured.\nTap ring or temple to try again.')
+    await updateBodyIfGlassesReady(buildStatusPageText('No Voice', ['No voice captured.', 'tap/ring retry']))
     await updateStatusIfGlassesReady('Idle | tap/ring: speak')
     return
   }
 
   chatState = 'thinking'
   setWebState('Transcribing')
-  await updateBodyIfGlassesReady('HermesGlass\n\nTranscribing voice...')
+  await updateBodyIfGlassesReady(buildVoiceStatusText('transcribing', Math.round(appConfig.maxRecordingMs / 1000)))
   await updateStatusIfGlassesReady('Transcribing...')
 
   try {
@@ -1497,7 +1513,7 @@ async function stopVoiceRecordingAndSend() {
     chatState = 'idle'
     setWebState('STT Error')
     const msg = err instanceof Error ? err.message : String(err)
-    await updateBodyIfGlassesReady(`HermesGlass\n\nVoice transcription failed:\n${cleanForG2(msg)}\n\nTap ring or temple to try again.`)
+    await updateBodyIfGlassesReady(buildVoiceStatusText('stt-error', Math.round(appConfig.maxRecordingMs / 1000), msg))
     await updateStatusIfGlassesReady('STT error | tap/ring: retry')
   }
 }
@@ -1651,7 +1667,7 @@ async function handleEvent(event: any) {
             await updateStatus(`Page ${currentPage + 1}/${pages.length} | tap: next | double: back`)
           } else {
             chatState = 'idle'
-            await updateBody('HermesGlass\n\nEnd.\nTap to ask again.')
+            await updateBody(buildStatusPageText('End', ['tap/ring ask again']))
             await updateStatus('Idle | tap: ask | double: back')
           }
           break
@@ -1711,7 +1727,7 @@ async function main() {
     xPosition: 0, yPosition: 0, width: DISPLAY_W, height: BODY_H,
     borderWidth: 0, borderColor: 5, paddingLength: BODY_PAD,
     containerID: 1, containerName: 'body',
-    content: 'HermesGlass\n\nLoading...',
+    content: buildStatusPageText('HermesGlass', ['Loading...']),
     isEventCapture: 1,
   })
   const status = new TextContainerProperty({
